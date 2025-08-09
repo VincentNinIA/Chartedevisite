@@ -34,7 +34,7 @@ PROP_NOTES   = "Parlez nous de vos besoins en quelques mots"            # rich_t
 
 # Valeurs/Options attendues
 TARGET_STATUS_VALUE = "Leads entrant"
-TOPIC_OPTIONS = ["Formation", "Module", "Audit IA"]
+TOPIC_OPTIONS = ["Formation", "Module", "Audit"]
 
 # Notion client & Mistral
 notion  = Notion(auth=NOTION_TOKEN)
