@@ -30,7 +30,7 @@ PROP_COMPANY = "Entreprise"                            # rich_text
 PROP_EMAIL   = "E-mail"                                # email
 PROP_PHONE   = "Téléphone"                             # phone_number
 PROP_TOPIC   = "De quoi désirez-vous discuter ?"       # multi_select
-PROP_NOTES   = "Parlez nous de vos besoins"            # rich_text (tes notes)
+PROP_NOTES   = "Parlez nous de vos besoins en quelques mots"            # rich_text (tes notes)
 
 # Valeurs/Options attendues
 TARGET_STATUS_VALUE = "Leads entrant"
