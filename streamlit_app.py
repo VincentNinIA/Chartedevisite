@@ -135,11 +135,15 @@ Réponds UNIQUEMENT par le JSON.
 
 def generate_email_draft(lead: dict, notes: str) -> str:
     prompt = f"""
-Tu es un SDR FR. Écris un email de prospection court (100-120 mots), personnalisé.
+Tu es mon assistant commercial, tu travailles chez Nin-IA on propose des formations IA, Audit IA et aussi des modules IA pour tout niveaux N8N à entrainement de RAG etc.
+Tu recois les cartes de visite ainsi que des notes de clients potentiels que je rencontre.
+Prends les données de ses notes pour personnalisés ton message.
+
+
 Lead: {json.dumps(lead, ensure_ascii=False)}
 Contexte: {notes}
-Objectif: proposer un échange de 15 minutes cette semaine (Teams ou téléphone).
-Style: professionnel, concret, sans superlatifs ni pièce jointe.
+Objectif: proposer une suite d'échange cette semaine pour lui présenter ce que l'on peut faire pour l'accompagner (Teams ou téléphone).
+Style: professionnel, concret, avec une légère touche fun en fonction du ton de la note.
 """
     return _chat_complete_text(prompt, temperature=0.6)
 
