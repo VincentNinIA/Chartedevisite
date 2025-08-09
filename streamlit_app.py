@@ -1,8 +1,11 @@
-import base64, io, json, re, requests
+# streamlit_app.py
+import base64
+import json
+import re
+import requests
 import streamlit as st
 from notion_client import Client as Notion
-from mistralai.client import MistralClient
-from mistralai.models.chat_completion import ChatMessage
+from mistralai import Mistral  # SDK récent
 
 # ===================
 # CONFIG
@@ -18,36 +21,33 @@ MISTRAL_OCR_URL   = st.secrets.get("MISTRAL_OCR_URL", "https://api.mistral.ai/v1
 MISTRAL_OCR_MODEL = st.secrets.get("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
 
 # Chat (SDK)
-MISTRAL_CHAT_MODEL= st.secrets.get("MISTRAL_CHAT_MODEL", "mistral-large-latest")
+MISTRAL_CHAT_MODEL = st.secrets.get("MISTRAL_CHAT_MODEL", "mistral-large-latest")
 
 notion  = Notion(auth=NOTION_TOKEN)
-mistral = MistralClient(api_key=MISTRAL_KEY)
+mistral = Mistral(api_key=MISTRAL_KEY)
 
 # ===================
 # HELPERS
 # ===================
 def _guess_data_url(image_bytes: bytes, fallback="image/jpeg") -> str:
-    # Streamlit camera_input renvoie généralement JPEG.
-    # Si besoin, détecte sommairement PNG.
+    """Constitue une data URL base64 correcte pour l’endpoint OCR."""
     header = image_bytes[:8]
-    mime = "image/png" if header.startswith(b"\x89PNG\r\n\x1a\n") else fallback
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif header[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    else:
+        mime = fallback
     b64 = base64.b64encode(image_bytes).decode()
     return f"data:{mime};base64,{b64}"
 
 def call_mistral_ocr(image_bytes: bytes) -> str:
-    """
-    OCR Mistral avec payload conforme:
-    {
-      "model": "...",
-      "document": {"type":"image_url","image_url":"data:image/jpeg;base64,..."}
-    }
-    Retour: concat des pages[i].markdown
-    """
+    """Appel OCR Mistral (payload conforme). Retourne le markdown concaténé."""
     data_url = _guess_data_url(image_bytes)
     payload = {
         "model": MISTRAL_OCR_MODEL,
         "document": {"type": "image_url", "image_url": data_url},
-        # "include_image_base64": False  # optionnel
+        # "include_image_base64": False,  # optionnel
     }
     r = requests.post(
         MISTRAL_OCR_URL,
@@ -58,9 +58,29 @@ def call_mistral_ocr(image_bytes: bytes) -> str:
     r.raise_for_status()
     resp = r.json()
     pages = resp.get("pages", [])
-    return "\n\n".join(p.get("markdown", "") for p in pages) or resp.get("text", "")
+    text = "\n\n".join(p.get("markdown", "") for p in pages).strip()
+    return text or resp.get("text", "")
+
+def _chat_complete_text(prompt: str, temperature: float = 0.3) -> str:
+    """Compat: extrait le texte du retour chat.complete pour différentes versions du SDK."""
+    res = mistral.chat.complete(
+        model=MISTRAL_CHAT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+    )
+    # Tentative format récent
+    try:
+        return res.output[0].content[0].text.strip()
+    except Exception:
+        pass
+    # Fallback format ancien
+    try:
+        return res.choices[0].message.content.strip()
+    except Exception:
+        return ""
 
 def naive_extract(text: str) -> dict:
+    """Fallback rapide sans LLM pour pré-remplir."""
     email = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
     phone = re.search(r'(\+?\d[\d\s\.\-]{7,}\d)', text)
     website = re.search(r'(https?://[^\s]+|www\.[^\s]+)', text)
@@ -89,20 +109,16 @@ def naive_extract(text: str) -> dict:
     }
 
 def llm_structurize(rough: dict) -> dict:
+    """Nettoyage/normalisation stricte via LLM (réponse JSON uniquement)."""
     prompt = f"""
-Tu reçois un dict Python avec des champs d'un lead issu d'une carte de visite.
-Objectif: renvoyer STRICTEMENT un JSON avec clés:
+Tu reçois un dict Python avec des champs potentiellement incomplets d'un lead issu d'une carte de visite.
+Objectif: renvoyer STRICTEMENT un JSON avec les clés:
 full_name, company, job_title, email, phone (format E.164 si possible), website, address.
 N'invente rien: mets null si inconnu. Corrige formats FR (tél).
 Objet: {json.dumps(rough, ensure_ascii=False)}
 Réponds UNIQUEMENT par le JSON.
 """
-    resp = mistral.chat(
-        model=MISTRAL_CHAT_MODEL,
-        messages=[ChatMessage(role="user", content=prompt)],
-        temperature=0.2,
-    )
-    content = resp.choices[0].message.content.strip()
+    content = _chat_complete_text(prompt, temperature=0.2)
     try:
         return json.loads(content)
     except Exception:
@@ -116,15 +132,10 @@ Contexte: {notes}
 Objectif: proposer un échange de 15 minutes cette semaine (Teams ou téléphone).
 Style: professionnel, concret, sans superlatifs ni pièce jointe.
 """
-    resp = mistral.chat(
-        model=MISTRAL_CHAT_MODEL,
-        messages=[ChatMessage(role="user", content=prompt)],
-        temperature=0.6,
-    )
-    return resp.choices[0].message.content.strip()
+    return _chat_complete_text(prompt, temperature=0.6)
 
 def notion_find_page_by_email(email: str):
-    """Recherche un lead existant par email dans la DB (anti-doublon simple)."""
+    """Recherche un lead existant par email (anti-doublon simple)."""
     if not email:
         return None
     try:
@@ -140,6 +151,7 @@ def notion_find_page_by_email(email: str):
         return None
 
 def notion_upsert_lead(lead: dict, email_draft: str) -> str:
+    """Crée ou met à jour la page Notion et ajoute le brouillon d'email."""
     props = {
         "Full Name": {"title":[{"text":{"content": lead.get("full_name") or "Lead (inconnu)"}}]},
         "Company": {"rich_text":[{"text":{"content": lead.get("company") or ""}}]},
