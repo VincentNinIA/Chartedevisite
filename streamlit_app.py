@@ -22,6 +22,7 @@ MISTRAL_OCR_MODEL = st.secrets.get("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
 
 # Chat (SDK)
 MISTRAL_CHAT_MODEL = st.secrets.get("MISTRAL_CHAT_MODEL", "mistral-large-latest")
+MISTRAL_AGENTS_URL  = st.secrets.get("MISTRAL_AGENTS_URL", "https://api.mistral.ai/v1")
 
 # ----- NOMS EXACTS DE TES PROPRIÉTÉS NOTION -----
 PROP_TITLE   = "Nom"                                   # title
@@ -92,6 +93,137 @@ def _chat_complete_text(prompt: str, temperature: float = 0.3) -> str:
     except Exception:
         return ""
 
+# ===================
+# Websearch Agent (Mistral Agents)
+# ===================
+def _create_websearch_agent() -> str:
+    """
+    Crée un agent Mistral avec le connecteur web_search et renvoie son agent_id.
+    Doc: https://docs.mistral.ai/agents/connectors/websearch/
+    """
+    url = f"{MISTRAL_AGENTS_URL}/agents"
+    payload = {
+        "model": st.secrets.get("MISTRAL_AGENT_MODEL", MISTRAL_CHAT_MODEL),
+        "name": "Websearch Agent",
+        "description": "Agent capable de chercher sur le web des infos récentes (personne, entreprise).",
+        "instructions": "Utilise le connecteur web_search pour chercher des informations factuelles et références.",
+        "tools": [{"type": "web_search"}],
+        "completion_args": {"temperature": 0.2, "top_p": 0.95},
+    }
+    r = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {MISTRAL_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data.get("id") or data.get("agent_id")
+
+
+def get_websearch_agent_id() -> str | None:
+    """Récupère/crée et met en cache l'agent_id en session."""
+    key = "mistral_websearch_agent_id"
+    if key in st.session_state and st.session_state[key]:
+        return st.session_state[key]
+    try:
+        agent_id = _create_websearch_agent()
+        st.session_state[key] = agent_id
+        return agent_id
+    except Exception:
+        return None
+
+
+def _ask_websearch_agent(agent_id: str, query: str) -> tuple[str, list[dict]]:
+    """
+    Démarre une conversation avec l’agent et renvoie (texte, références[]).
+    Chaque référence: {title, url, source}
+    """
+    url = f"{MISTRAL_AGENTS_URL}/conversations"
+    payload = {"agent_id": agent_id, "inputs": query, "stream": False}
+    r = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {MISTRAL_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+    r.raise_for_status()
+    data = r.json()
+    outputs = data.get("outputs", [])
+    text_parts: list[str] = []
+    refs: list[dict] = []
+    for entry in outputs:
+        if entry.get("type") == "message.output":
+            for chunk in entry.get("content", []) or []:
+                if chunk.get("type") == "text" and chunk.get("text"):
+                    text_parts.append(chunk["text"]) 
+                elif chunk.get("type") == "tool_reference" and chunk.get("url"):
+                    refs.append({
+                        "title": chunk.get("title") or chunk.get("url"),
+                        "url": chunk.get("url"),
+                        "source": chunk.get("source"),
+                    })
+    return ("\n".join(text_parts).strip() or "", refs)
+
+
+def build_websearch_queries(lead: dict) -> list[str]:
+    full_name = (lead.get("full_name") or "").strip()
+    company = (lead.get("company") or "").strip()
+    role = (lead.get("job_title") or "").strip()
+    queries: list[str] = []
+    if full_name and company:
+        queries.append(f"Informations récentes et profil public de {full_name} ({role}) chez {company}.")
+    elif full_name:
+        queries.append(f"Profil public et informations professionnelles de {full_name} ({role}).")
+    if company:
+        queries.append(f"Résumé de {company} (activité, effectifs, actualités récentes, produits, stack, besoins).")
+        queries.append(f"Opportunités d'usage de l'IA pour {company} par domaine (marketing, ops, support, data).")
+    return [q for q in queries if q]
+
+
+def run_web_enrichment(lead: dict, user_notes: str) -> tuple[str, list[dict]]:
+    """
+    Tente la recherche web via Mistral Agents; fallback: synthèse via LLM sans navigation.
+    Renvoie (synthèse, références[]).
+    """
+    agent_id = get_websearch_agent_id()
+    queries = build_websearch_queries(lead)
+    if agent_id and queries:
+        try:
+            final_text: list[str] = []
+            all_refs: list[dict] = []
+            for q in queries:
+                text, refs = _ask_websearch_agent(agent_id, q)
+                if text:
+                    final_text.append(text)
+                if refs:
+                    all_refs.extend(refs)
+            if final_text:
+                # Ajoute un cadrage pour l'IA
+                final_text.append(
+                    "\nSynthèse actionnable: propose des pistes concrètes où Nin-IA peut aider (formations, audits, modules) adaptées au contexte ci-dessus."
+                )
+                return ("\n\n".join(final_text), all_refs)
+        except Exception:
+            pass
+    # Fallback: pas d'agent ou échec ⇒ synthèse sans navigation
+    prompt = f"""
+Tu vas générer un bref contexte exploitable sur ce lead puis des idées d'usage de l'IA.
+Lead: {json.dumps(lead, ensure_ascii=False)}
+Notes: {user_notes}
+1) Contexte probable (sans inventer de faits précis non mentionnés) — hypothèses marquées explicitement.
+2) 6 idées d'applications IA concrètes par domaine (marketing, ops, support, data, RH, produit), format liste.
+"""
+    return (_chat_complete_text(prompt, temperature=0.4), [])
+
 def naive_extract(text: str) -> dict:
     email = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
     phone = re.search(r'(\+?\d[\d\s\.\-]{7,}\d)', text)
@@ -133,7 +265,7 @@ Réponds UNIQUEMENT par le JSON.
     except Exception:
         return rough
 
-def generate_email_draft(lead: dict, notes: str) -> str:
+def generate_email_draft(lead: dict, notes: str, web_context: str | None = None) -> str:
     prompt = f"""
 Tu es mon assistant commercial, tu travailles chez Nin-IA on propose des formations IA, Audit IA et aussi des modules IA pour tout niveaux N8N à entrainement de RAG etc.
 Tu recois les cartes de visite ainsi que des notes de clients potentiels que je rencontre.
@@ -145,6 +277,8 @@ Contexte: {notes}
 Objectif: proposer une suite d'échange cette semaine pour lui présenter ce que l'on peut faire pour l'accompagner (Teams ou téléphone).
 Style: professionnel, concret, avec une légère touche fun en fonction du ton de la note.
 """
+    if web_context:
+        prompt += f"\n\nContexte trouvé en ligne (synthèse):\n{web_context[:4000]}\n"
     return _chat_complete_text(prompt, temperature=0.6)
 
 # ===================
@@ -282,7 +416,11 @@ if st.button("Traiter") and img:
     with st.spinner("Normalisation (LLM)…"):
         lead = llm_structurize(rough)
 
-    # 3) Notion (upsert + statut + sujets + notes)
+    # 3) Websearch (personne / entreprise) via Mistral Agents
+    with st.spinner("Recherche web (Mistral)…"):
+        web_summary, web_refs = run_web_enrichment(lead, notes)
+
+    # 4) Notion (upsert + statut + sujets + notes)
     try:
         with st.spinner("Écriture dans Notion…"):
             page_id = notion_upsert_lead(lead, topics, notes)
@@ -290,9 +428,9 @@ if st.button("Traiter") and img:
         st.error(f"Notion en échec : {e}")
         st.stop()
 
-    # 4) Brouillon d’email (si champ approprié présent)
+    # 5) Brouillon d’email (si champ approprié présent)
     with st.spinner("Rédaction du brouillon d’email…"):
-        draft = generate_email_draft(lead, notes)
+        draft = generate_email_draft(lead, notes, web_context=web_summary or None)
         notion_set_email_draft(page_id, draft)
 
     st.success("✅ Lead créé/mis à jour (Statut = Leads entrant) + sujets + notes + brouillon ajouté.")
@@ -301,5 +439,18 @@ if st.button("Traiter") and img:
 
     with st.expander("Texte OCR"):
         st.text(ocr_text)
+
+    st.subheader("Contexte trouvé en ligne (Mistral Websearch)")
+    if web_summary:
+        st.markdown(web_summary)
+    else:
+        st.caption("Aucun résumé disponible.")
+    if web_refs:
+        st.caption("Sources")
+        for ref in web_refs[:8]:
+            title = ref.get("title") or ref.get("url")
+            url = ref.get("url")
+            src = ref.get("source")
+            st.markdown(f"- [{title}]({url}){f' — {src}' if src else ''}")
 else:
     st.caption("Autorise la caméra sur mobile, ou dépose un fichier.")
