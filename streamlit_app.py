@@ -32,6 +32,7 @@ PROP_EMAIL   = "E-mail"                                # email
 PROP_PHONE   = "Téléphone"                             # phone_number
 PROP_TOPIC   = "De quoi désirez-vous discuter ?"       # multi_select
 PROP_NOTES   = "Parlez nous de vos besoins en quelques mots"            # rich_text (tes notes)
+PROP_EMAIL_DRAFT = "Brouillon à envoyer"  # rich_text pour le brouillon
 
 # Valeurs/Options attendues
 TARGET_STATUS_VALUE = "Leads entrant"
@@ -354,25 +355,34 @@ def notion_upsert_lead(lead: dict, topics: list, notes: str) -> str:
         return page["id"]
 
 def notion_set_email_draft(page_id: str, draft: str):
-    # Essaie de trouver une propriété rich_text probable pour le brouillon
+    # Écrit le brouillon dans la propriété dédiée si elle existe, sinon tente des alternatives
     db_meta = notion_get_db_meta()
-    candidates = [ "Email draft", "Brouillon", "Proposition d'email", "Email" ]
-    lower_map = {k.lower(): k for k in db_meta["properties"].keys()}
-    prop_name = None
+    properties = db_meta.get("properties", {})
+
+    # 1) Priorité: PROP_EMAIL_DRAFT
+    if PROP_EMAIL_DRAFT in properties and properties[PROP_EMAIL_DRAFT]["type"] == "rich_text":
+        try:
+            notion.pages.update(page_id=page_id, properties={
+                PROP_EMAIL_DRAFT: {"rich_text": [{"text": {"content": draft}}]}
+            })
+            return
+        except Exception:
+            pass
+
+    # 2) Fallback: quelques noms usuels
+    candidates = ["Brouillon à envoyer", "Email draft", "Brouillon", "Proposition d'email", "Email"]
+    lower_map = {k.lower(): k for k in properties.keys()}
     for c in candidates:
         k = lower_map.get(c.lower())
-        if k and db_meta["properties"][k]["type"] == "rich_text":
-            prop_name = k
-            break
-    if not prop_name:
-        return  # pas de champ brouillon, on skip
-
-    try:
-        notion.pages.update(page_id=page_id, properties={
-            prop_name: {"rich_text": [{"text": {"content": draft}}]}
-        })
-    except Exception:
-        pass
+        if k and properties[k]["type"] == "rich_text":
+            try:
+                notion.pages.update(page_id=page_id, properties={
+                    k: {"rich_text": [{"text": {"content": draft}}]}
+                })
+                return
+            except Exception:
+                continue
+    # Sinon: aucun champ compatible, on ne fait rien
 
 # ===================
 # UI
