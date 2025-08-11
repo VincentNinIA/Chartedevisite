@@ -6,6 +6,7 @@ import requests
 import streamlit as st
 from notion_client import Client as Notion
 from mistralai import Mistral  # SDK récent
+import unicodedata
 
 # ===================
 # CONFIG
@@ -354,35 +355,142 @@ def notion_upsert_lead(lead: dict, topics: list, notes: str) -> str:
         page = notion.pages.create(parent={"database_id": NOTION_DB}, properties=props)
         return page["id"]
 
-def notion_set_email_draft(page_id: str, draft: str):
-    # Écrit le brouillon dans la propriété dédiée si elle existe, sinon tente des alternatives
-    db_meta = notion_get_db_meta()
+def _to_rich_text_chunks(text: str, chunk_size: int = 1800) -> list[dict]:
+    chunks: list[dict] = []
+    if not text:
+        return [{"text": {"content": ""}}]
+    for i in range(0, len(text), chunk_size):
+        segment = text[i : i + chunk_size]
+        chunks.append({"text": {"content": segment}})
+    return chunks
+
+
+def _normalize_name(name: str) -> str:
+    if not name:
+        return ""
+    nf = unicodedata.normalize("NFD", name)
+    without_accents = "".join(ch for ch in nf if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", without_accents).strip().lower()
+
+
+def _find_property_key(target: str, properties: dict) -> str | None:
+    # 1) exact
+    if target in properties:
+        return target
+    # 2) case-insensitive
+    lower_map = {k.lower(): k for k in properties.keys()}
+    if target.lower() in lower_map:
+        return lower_map[target.lower()]
+    # 3) accent-insensitive
+    norm_target = _normalize_name(target)
+    norm_map = {_normalize_name(k): k for k in properties.keys()}
+    return norm_map.get(norm_target)
+
+
+def _ensure_rich_text_property(prop_name: str) -> tuple[bool, str | None]:
+    """Crée/convertit la propriété en rich_text dans la base si nécessaire."""
+    try:
+        db_meta = notion_get_db_meta()
+        props = db_meta.get("properties", {})
+        key = _find_property_key(prop_name, props)
+        if key and props[key].get("type") == "rich_text":
+            return True, None
+        # Créer/mettre à jour le schéma
+        notion.databases.update(
+            database_id=NOTION_DB,
+            properties={prop_name: {"rich_text": {}}},
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def notion_set_email_draft(page_id: str, draft: str) -> tuple[bool, str | None]:
+    """Met à jour le champ brouillon dans Notion.
+    Retourne (ok, message_erreur).
+    """
+    try:
+        db_meta = notion_get_db_meta()
+    except Exception as e:
+        return False, f"Lecture schéma Notion impossible: {e}"
+
     properties = db_meta.get("properties", {})
 
-    # 1) Priorité: PROP_EMAIL_DRAFT
-    if PROP_EMAIL_DRAFT in properties and properties[PROP_EMAIL_DRAFT]["type"] == "rich_text":
+    # 1) Trouver la clé réelle (gère casse/accents), puis vérifier le type
+    prop_key = _find_property_key(PROP_EMAIL_DRAFT, properties)
+    if prop_key:
+        ptype = properties[prop_key].get("type")
+        if ptype != "rich_text":
+            # Tenter la mise à jour du schéma en rich_text
+            ok_schema, err_schema = _ensure_rich_text_property(PROP_EMAIL_DRAFT)
+            if not ok_schema:
+                return False, f"La propriété '{prop_key}' n'est pas rich_text (type: {ptype}) et MAJ schéma impossible: {err_schema}"
         try:
-            notion.pages.update(page_id=page_id, properties={
-                PROP_EMAIL_DRAFT: {"rich_text": [{"text": {"content": draft}}]}
-            })
-            return
-        except Exception:
-            pass
+            notion.pages.update(
+                page_id=page_id,
+                properties={prop_key: {"rich_text": _to_rich_text_chunks(draft)}},
+            )
+            # Vérification lecture
+            page = notion.pages.retrieve(page_id)
+            val = page.get("properties", {}).get(prop_key, {})
+            rt = val.get("rich_text", [])
+            ok = bool(rt and (rt[0].get("plain_text") or rt[0].get("text", {}).get("content")))
+            return (True, None) if ok else (False, "Écriture effectuée mais lecture vide après mise à jour.")
+        except Exception as e:
+            return False, f"Échec mise à jour Notion: {e}"
 
-    # 2) Fallback: quelques noms usuels
+    # 2) Fallback: quelques noms usuels si l'exact n'est pas trouvé
     candidates = ["Brouillon à envoyer", "Email draft", "Brouillon", "Proposition d'email", "Email"]
     lower_map = {k.lower(): k for k in properties.keys()}
     for c in candidates:
         k = lower_map.get(c.lower())
-        if k and properties[k]["type"] == "rich_text":
-            try:
-                notion.pages.update(page_id=page_id, properties={
-                    k: {"rich_text": [{"text": {"content": draft}}]}
-                })
-                return
-            except Exception:
-                continue
-    # Sinon: aucun champ compatible, on ne fait rien
+        if not k:
+            continue
+        if properties[k].get("type") != "rich_text":
+            continue
+        try:
+            notion.pages.update(
+                page_id=page_id,
+                properties={k: {"rich_text": _to_rich_text_chunks(draft)}},
+            )
+            page = notion.pages.retrieve(page_id)
+            val = page.get("properties", {}).get(k, {})
+            rt = val.get("rich_text", [])
+            ok = bool(rt and (rt[0].get("plain_text") or rt[0].get("text", {}).get("content")))
+            return (True, None) if ok else (False, f"Écriture sur '{k}' effectuée mais lecture vide.")
+        except Exception as e:
+            return False, f"Échec mise à jour sur '{k}': {e}"
+
+    return False, f"Propriété '{PROP_EMAIL_DRAFT}' introuvable dans la base Notion, et aucun fallback compatible."
+
+
+def notion_append_email_draft_block(page_id: str, draft: str) -> tuple[bool, str | None]:
+    """Ajoute un bloc visible dans le contenu de la page (heading + code/markdown).
+    Utile si l'utilisateur a ajouté un 'onglet' (section) dans la page plutôt qu'une propriété.
+    """
+    try:
+        heading_block = {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {
+                "rich_text": [{"type": "text", "text": {"content": "Brouillon à envoyer"}}]
+            },
+        }
+        code_block = {
+            "object": "block",
+            "type": "code",
+            "code": {
+                "language": "markdown",
+                "rich_text": [
+                    {"type": "text", "text": {"content": chunk["text"]["content"]}}
+                    for chunk in _to_rich_text_chunks(draft)
+                ],
+            },
+        }
+        notion.blocks.children.append(block_id=page_id, children=[heading_block, code_block])
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 # ===================
 # UI
@@ -441,7 +549,32 @@ if st.button("Traiter") and img:
     # 5) Brouillon d’email (si champ approprié présent)
     with st.spinner("Rédaction du brouillon d’email…"):
         draft = generate_email_draft(lead, notes, web_context=web_summary or None)
-        notion_set_email_draft(page_id, draft)
+        ok, err = notion_set_email_draft(page_id, draft)
+        if ok:
+            # Lecture/aperçu pour vérifier
+            try:
+                db_meta_dbg = notion_get_db_meta()
+                props_dbg = db_meta_dbg.get("properties", {})
+                resolved_key = _find_property_key(PROP_EMAIL_DRAFT, props_dbg) or PROP_EMAIL_DRAFT
+                page_dbg = notion.pages.retrieve(page_id)
+                val_dbg = page_dbg.get("properties", {}).get(resolved_key, {})
+                rt_dbg = val_dbg.get("rich_text", [])
+                preview = "".join(
+                    [(item.get("plain_text") or item.get("text", {}).get("content", "")) for item in rt_dbg]
+                )
+                st.success(f"Brouillon écrit dans la propriété Notion ‘{resolved_key}’ ({len(preview)} caractères).")
+                if preview:
+                    st.caption("Aperçu de la valeur enregistrée dans Notion:")
+                    st.code(preview[:700], language="markdown")
+            except Exception:
+                pass
+        else:
+            st.warning(f"Propriété Notion non mise à jour: {err}. J'essaie d'ajouter un bloc dans la page…")
+            ok2, err2 = notion_append_email_draft_block(page_id, draft)
+            if ok2:
+                st.info("Brouillon ajouté dans le corps de la page Notion (bloc).")
+            else:
+                st.error(f"Échec d'ajout du brouillon dans le corps de la page: {err2}")
 
     st.success("✅ Lead créé/mis à jour (Statut = Leads entrant) + sujets + notes + brouillon ajouté.")
     st.subheader("Brouillon")
