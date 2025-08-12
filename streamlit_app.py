@@ -4,6 +4,7 @@ import json
 import re
 import requests
 import streamlit as st
+from typing import List, Dict, Optional, Tuple
 from notion_client import Client as Notion
 from mistralai import Mistral  # SDK récent
 import unicodedata
@@ -23,23 +24,26 @@ MISTRAL_OCR_MODEL = st.secrets.get("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
 
 # Chat (SDK)
 MISTRAL_CHAT_MODEL = st.secrets.get("MISTRAL_CHAT_MODEL", "mistral-large-latest")
+
+# Agents (websearch)
 MISTRAL_AGENTS_URL  = st.secrets.get("MISTRAL_AGENTS_URL", "https://api.mistral.ai/v1")
+MISTRAL_AGENT_MODEL = st.secrets.get("MISTRAL_AGENT_MODEL", MISTRAL_CHAT_MODEL)
 
 # ----- NOMS EXACTS DE TES PROPRIÉTÉS NOTION -----
-PROP_TITLE   = "Nom"                                   # title
-PROP_STATUS  = "Statut"                                # status OU select
-PROP_COMPANY = "Entreprise"                            # rich_text
-PROP_EMAIL   = "E-mail"                                # email
-PROP_PHONE   = "Téléphone"                             # phone_number
-PROP_TOPIC   = "De quoi désirez-vous discuter ?"       # multi_select
-PROP_NOTES   = "Parlez nous de vos besoins en quelques mots"            # rich_text (tes notes)
-PROP_EMAIL_DRAFT = "Brouillon à envoyer"  # rich_text pour le brouillon
+PROP_TITLE        = "Nom"                                           # title
+PROP_STATUS       = "Statut"                                        # status OU select
+PROP_COMPANY      = "Entreprise"                                    # rich_text
+PROP_EMAIL        = "E-mail"                                        # email
+PROP_PHONE        = "Téléphone"                                     # phone_number
+PROP_TOPIC        = "De quoi désirez-vous discuter ?"               # multi_select
+PROP_NOTES        = "Parlez nous de vos besoins en quelques mots"   # rich_text
+PROP_EMAIL_DRAFT  = "Brouillon à envoyer"                           # rich_text
 
 # Valeurs/Options attendues
 TARGET_STATUS_VALUE = "Leads entrant"
-TOPIC_OPTIONS = ["Formation", "Module", "Audit"]
+TOPIC_OPTIONS = ["Formation", "Module", "Audit IA"]
 
-# Notion client & Mistral
+# Clients
 notion  = Notion(auth=NOTION_TOKEN)
 mistral = Mistral(api_key=MISTRAL_KEY)
 
@@ -95,138 +99,7 @@ def _chat_complete_text(prompt: str, temperature: float = 0.3) -> str:
     except Exception:
         return ""
 
-# ===================
-# Websearch Agent (Mistral Agents)
-# ===================
-def _create_websearch_agent() -> str:
-    """
-    Crée un agent Mistral avec le connecteur web_search et renvoie son agent_id.
-    Doc: https://docs.mistral.ai/agents/connectors/websearch/
-    """
-    url = f"{MISTRAL_AGENTS_URL}/agents"
-    payload = {
-        "model": st.secrets.get("MISTRAL_AGENT_MODEL", MISTRAL_CHAT_MODEL),
-        "name": "Websearch Agent",
-        "description": "Agent capable de chercher sur le web des infos récentes (personne, entreprise).",
-        "instructions": "Utilise le connecteur web_search pour chercher des informations factuelles et références.",
-        "tools": [{"type": "web_search"}],
-        "completion_args": {"temperature": 0.2, "top_p": 0.95},
-    }
-    r = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {MISTRAL_KEY}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        json=payload,
-        timeout=30,
-    )
-    r.raise_for_status()
-    data = r.json()
-    return data.get("id") or data.get("agent_id")
-
-
-def get_websearch_agent_id() -> str | None:
-    """Récupère/crée et met en cache l'agent_id en session."""
-    key = "mistral_websearch_agent_id"
-    if key in st.session_state and st.session_state[key]:
-        return st.session_state[key]
-    try:
-        agent_id = _create_websearch_agent()
-        st.session_state[key] = agent_id
-        return agent_id
-    except Exception:
-        return None
-
-
-def _ask_websearch_agent(agent_id: str, query: str) -> tuple[str, list[dict]]:
-    """
-    Démarre une conversation avec l’agent et renvoie (texte, références[]).
-    Chaque référence: {title, url, source}
-    """
-    url = f"{MISTRAL_AGENTS_URL}/conversations"
-    payload = {"agent_id": agent_id, "inputs": query, "stream": False}
-    r = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {MISTRAL_KEY}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        json=payload,
-        timeout=60,
-    )
-    r.raise_for_status()
-    data = r.json()
-    outputs = data.get("outputs", [])
-    text_parts: list[str] = []
-    refs: list[dict] = []
-    for entry in outputs:
-        if entry.get("type") == "message.output":
-            for chunk in entry.get("content", []) or []:
-                if chunk.get("type") == "text" and chunk.get("text"):
-                    text_parts.append(chunk["text"]) 
-                elif chunk.get("type") == "tool_reference" and chunk.get("url"):
-                    refs.append({
-                        "title": chunk.get("title") or chunk.get("url"),
-                        "url": chunk.get("url"),
-                        "source": chunk.get("source"),
-                    })
-    return ("\n".join(text_parts).strip() or "", refs)
-
-
-def build_websearch_queries(lead: dict) -> list[str]:
-    full_name = (lead.get("full_name") or "").strip()
-    company = (lead.get("company") or "").strip()
-    role = (lead.get("job_title") or "").strip()
-    queries: list[str] = []
-    if full_name and company:
-        queries.append(f"Informations récentes et profil public de {full_name} ({role}) chez {company}.")
-    elif full_name:
-        queries.append(f"Profil public et informations professionnelles de {full_name} ({role}).")
-    if company:
-        queries.append(f"Résumé de {company} (activité, effectifs, actualités récentes, produits, stack, besoins).")
-        queries.append(f"Opportunités d'usage de l'IA pour {company} par domaine (marketing, ops, support, data).")
-    return [q for q in queries if q]
-
-
-def run_web_enrichment(lead: dict, user_notes: str) -> tuple[str, list[dict]]:
-    """
-    Tente la recherche web via Mistral Agents; fallback: synthèse via LLM sans navigation.
-    Renvoie (synthèse, références[]).
-    """
-    agent_id = get_websearch_agent_id()
-    queries = build_websearch_queries(lead)
-    if agent_id and queries:
-        try:
-            final_text: list[str] = []
-            all_refs: list[dict] = []
-            for q in queries:
-                text, refs = _ask_websearch_agent(agent_id, q)
-                if text:
-                    final_text.append(text)
-                if refs:
-                    all_refs.extend(refs)
-            if final_text:
-                # Ajoute un cadrage pour l'IA
-                final_text.append(
-                    "\nSynthèse actionnable: propose des pistes concrètes où Nin-IA peut aider (formations, audits, modules) adaptées au contexte ci-dessus."
-                )
-                return ("\n\n".join(final_text), all_refs)
-        except Exception:
-            pass
-    # Fallback: pas d'agent ou échec ⇒ synthèse sans navigation
-    prompt = f"""
-Tu vas générer un bref contexte exploitable sur ce lead puis des idées d'usage de l'IA.
-Lead: {json.dumps(lead, ensure_ascii=False)}
-Notes: {user_notes}
-1) Contexte probable (sans inventer de faits précis non mentionnés) — hypothèses marquées explicitement.
-2) 6 idées d'applications IA concrètes par domaine (marketing, ops, support, data, RH, produit), format liste.
-"""
-    return (_chat_complete_text(prompt, temperature=0.4), [])
-
-def naive_extract(text: str) -> dict:
+def naive_extract(text: str) -> Dict:
     email = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
     phone = re.search(r'(\+?\d[\d\s\.\-]{7,}\d)', text)
 
@@ -252,7 +125,7 @@ def naive_extract(text: str) -> dict:
         "address": None
     }
 
-def llm_structurize(rough: dict) -> dict:
+def llm_structurize(rough: Dict) -> Dict:
     prompt = f"""
 Tu reçois un dict Python avec des champs potentiellement incomplets d'un lead issu d'une carte de visite.
 Objectif: renvoyer STRICTEMENT un JSON avec les clés:
@@ -267,29 +140,241 @@ Réponds UNIQUEMENT par le JSON.
     except Exception:
         return rough
 
-def generate_email_draft(lead: dict, notes: str, web_context: str | None = None) -> str:
+def generate_email_draft(lead: Dict, notes: str, web_context: Optional[str] = None) -> str:
     prompt = f"""
-Tu es mon assistant commercial, tu travailles chez Nin-IA on propose des formations IA, Audit IA et aussi des modules IA pour tout niveaux N8N à entrainement de RAG etc.
-Tu recois les cartes de visite ainsi que des notes de clients potentiels que je rencontre.
-Prends les données de ses notes pour personnalisés ton message.
-
+Tu es mon assistant commercial, tu travailles chez Nin-IA (formations IA, audits IA, modules IA).
+Tu reçois des cartes de visite + notes de clients potentiels. Personnalise l'email en te basant surtout sur les notes.
 
 Lead: {json.dumps(lead, ensure_ascii=False)}
-Contexte: {notes}
-Objectif: proposer une suite d'échange cette semaine pour lui présenter ce que l'on peut faire pour l'accompagner (Teams ou téléphone).
-Style: professionnel, concret, avec une légère touche fun en fonction du ton de la note.
+Notes: {notes}
+Objectif: proposer un échange (15 min) cette semaine (Teams ou téléphone).
+Style: pro, concret, ton léger si les notes le permettent. 100-120 mots.
 """
     if web_context:
-        prompt += f"\n\nContexte trouvé en ligne (synthèse):\n{web_context[:4000]}\n"
+        prompt += f"\n\nContexte trouvé en ligne (synthèse, à utiliser seulement si pertinent):\n{web_context[:4000]}\n"
     return _chat_complete_text(prompt, temperature=0.6)
 
 # ===================
-# NOTION
+# Agents (websearch)
 # ===================
-def notion_get_db_meta():
+def _create_websearch_agent() -> Optional[str]:
+    url = f"{MISTRAL_AGENTS_URL}/agents"
+    payload = {
+        "model": MISTRAL_AGENT_MODEL,
+        "name": "Websearch Agent",
+        "description": "Agent capable de chercher sur le web des infos récentes (personne, entreprise).",
+        "instructions": "Utilise le connecteur web_search pour chercher des informations factuelles et références.",
+        "tools": [{"type": "web_search"}],
+        "completion_args": {"temperature": 0.2, "top_p": 0.95},
+    }
+    r = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {MISTRAL_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data.get("id") or data.get("agent_id")
+
+def get_websearch_agent_id() -> Optional[str]:
+    key = "mistral_websearch_agent_id"
+    if key in st.session_state and st.session_state[key]:
+        return st.session_state[key]
+    try:
+        agent_id = _create_websearch_agent()
+        st.session_state[key] = agent_id
+        return agent_id
+    except Exception:
+        return None
+
+def _ask_websearch_agent(agent_id: str, query: str) -> Tuple[str, List[Dict]]:
+    url = f"{MISTRAL_AGENTS_URL}/conversations"
+    payload = {"agent_id": agent_id, "inputs": query, "stream": False}
+    r = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {MISTRAL_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+    r.raise_for_status()
+    data = r.json()
+    outputs = data.get("outputs", [])
+    text_parts: List[str] = []
+    refs: List[Dict] = []
+    for entry in outputs:
+        if entry.get("type") == "message.output":
+            for chunk in entry.get("content", []) or []:
+                if chunk.get("type") == "text" and chunk.get("text"):
+                    text_parts.append(chunk["text"])
+                elif chunk.get("type") == "tool_reference" and chunk.get("url"):
+                    refs.append({
+                        "title": chunk.get("title") or chunk.get("url"),
+                        "url": chunk.get("url"),
+                        "source": chunk.get("source"),
+                    })
+    return ("\n".join(text_parts).strip() or "", refs)
+
+def build_websearch_queries(lead: Dict) -> List[str]:
+    full_name = (lead.get("full_name") or "").strip()
+    company = (lead.get("company") or "").strip()
+    role = (lead.get("job_title") or "").strip()
+    queries: List[str] = []
+    if full_name and company:
+        queries.append(f"Informations récentes et profil public de {full_name} ({role}) chez {company}.")
+    elif full_name:
+        queries.append(f"Profil public et informations professionnelles de {full_name} ({role}).")
+    if company:
+        queries.append(f"Résumé de {company} (activité, effectifs, actualités récentes, produits).")
+        queries.append(f"Opportunités d'usage de l'IA pour {company} (marketing, ops, support, data).")
+    return [q for q in queries if q]
+
+def run_web_enrichment(lead: Dict, user_notes: str) -> Tuple[str, List[Dict]]:
+    agent_id = get_websearch_agent_id()
+    queries = build_websearch_queries(lead)
+    if agent_id and queries:
+        try:
+            final_text: List[str] = []
+            all_refs: List[Dict] = []
+            for q in queries:
+                text, refs = _ask_websearch_agent(agent_id, q)
+                if text:
+                    final_text.append(text)
+                if refs:
+                    all_refs.extend(refs)
+            if final_text:
+                final_text.append(
+                    "\nSynthèse actionnable: propose des pistes concrètes où Nin-IA peut aider (formations, audits, modules)."
+                )
+                return ("\n\n".join(final_text), all_refs)
+        except Exception:
+            pass
+    # Fallback sans web
+    prompt = f"""
+Tu vas générer un bref contexte exploitable sur ce lead puis des idées d'usage de l'IA.
+Lead: {json.dumps(lead, ensure_ascii=False)}
+Notes: {user_notes}
+1) Contexte probable (hypothèses explicites si nécessaire).
+2) 6 idées d'applications IA concrètes par domaine (marketing, ops, support, data, RH, produit), liste.
+"""
+    return (_chat_complete_text(prompt, temperature=0.4), [])
+
+# ===================
+# NOTION – utilitaires schéma
+# ===================
+def notion_get_db_meta() -> Dict:
     return notion.databases.retrieve(NOTION_DB)
 
-def notion_find_page_by_email(email: str):
+def _normalize_name(name: str) -> str:
+    if not name:
+        return ""
+    nf = unicodedata.normalize("NFD", name)
+    without_accents = "".join(ch for ch in nf if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", without_accents).strip().lower()
+
+def _find_property_key(target: str, properties: Dict) -> Optional[str]:
+    if target in properties:
+        return target
+    lower_map = {k.lower(): k for k in properties.keys()}
+    if target.lower() in lower_map:
+        return lower_map[target.lower()]
+    norm_target = _normalize_name(target)
+    norm_map = {_normalize_name(k): k for k in properties.keys()}
+    return norm_map.get(norm_target)
+
+def ensure_db_schema():
+    """Garantit que les propriétés clés existent avec le bon type; ajoute options si manquantes."""
+    meta = notion_get_db_meta()
+    props = meta.get("properties", {})
+
+    def ensure_rich_text(name: str):
+        if name in props and props[name]["type"] == "rich_text":
+            return
+        notion.databases.update(database_id=NOTION_DB, properties={name: {"rich_text": {}}})
+
+    def ensure_email(name: str):
+        if name in props and props[name]["type"] == "email":
+            return
+        notion.databases.update(database_id=NOTION_DB, properties={name: {"email": {}}})
+
+    def ensure_phone(name: str):
+        if name in props and props[name]["type"] == "phone_number":
+            return
+        notion.databases.update(database_id=NOTION_DB, properties={name: {"phone_number": {}}})
+
+    def ensure_multi_select(name: str, options: List[str]):
+        nonlocal props
+        if name not in props or props[name]["type"] != "multi_select":
+            notion.databases.update(
+                database_id=NOTION_DB,
+                properties={name: {"multi_select": {"options": [{"name": o} for o in options]}}}
+            )
+        else:
+            current = set(opt["name"] for opt in props[name]["multi_select"]["options"])
+            missing = [o for o in options if o not in current]
+            if missing:
+                new_opts = props[name]["multi_select"]["options"] + [{"name": o} for o in missing]
+                notion.databases.update(
+                    database_id=NOTION_DB,
+                    properties={name: {"multi_select": {"options": new_opts}}}
+                )
+
+    def ensure_status(name: str, required_value: str):
+        if name not in props:
+            notion.databases.update(
+                database_id=NOTION_DB,
+                properties={name: {"select": {"options": [{"name": required_value}]}}}
+            )
+            return
+        p = props[name]
+        if p["type"] == "status":
+            cur = set(opt["name"] for opt in p["status"]["options"])
+            if required_value not in cur:
+                new_opts = p["status"]["options"] + [{"name": required_value}]
+                notion.databases.update(
+                    database_id=NOTION_DB,
+                    properties={name: {"status": {"options": new_opts}}}
+                )
+        elif p["type"] == "select":
+            cur = set(opt["name"] for opt in p["select"]["options"])
+            if required_value not in cur:
+                new_opts = p["select"]["options"] + [{"name": required_value}]
+                notion.databases.update(
+                    database_id=NOTION_DB,
+                    properties={name: {"select": {"options": new_opts}}}
+                )
+        else:
+            notion.databases.update(
+                database_id=NOTION_DB,
+                properties={name: {"select": {"options": [{"name": required_value}]}}}
+            )
+
+    ensure_status(PROP_STATUS, TARGET_STATUS_VALUE)
+    ensure_email(PROP_EMAIL)
+    ensure_phone(PROP_PHONE)
+    ensure_rich_text(PROP_COMPANY)
+    ensure_rich_text(PROP_NOTES)
+    ensure_rich_text(PROP_EMAIL_DRAFT)
+    ensure_multi_select(PROP_TOPIC, TOPIC_OPTIONS)
+
+# Exécuter l’assurance schéma au démarrage
+try:
+    ensure_db_schema()
+except Exception as e:
+    st.warning(f"Impossible de garantir le schéma Notion (droits/partage ?) : {e}")
+
+# ===================
+# NOTION – CRUD
+# ===================
+def notion_find_page_by_email(email: Optional[str]) -> Optional[str]:
     if not email:
         return None
     try:
@@ -304,296 +389,16 @@ def notion_find_page_by_email(email: str):
     except Exception:
         return None
 
-def build_properties_for_upsert(lead: dict, topics: list, notes: str, db_meta: dict):
-    props = {}
-
-    # 1) Titre (Nom)
+def build_properties_for_upsert(lead: Dict, topics: List[str], notes: str, db_meta: Dict) -> Dict:
+    props: Dict = {}
+    # Titre
     props[PROP_TITLE] = {"title": [{"text": {"content": lead.get("full_name") or "Lead (inconnu)"}}]}
-
-    # 2) Statut (status ou select) -> "Leads entrant"
+    # Statut
     if PROP_STATUS in db_meta["properties"]:
         ptype = db_meta["properties"][PROP_STATUS]["type"]
         if ptype == "status":
             props[PROP_STATUS] = {"status": {"name": TARGET_STATUS_VALUE}}
         elif ptype == "select":
             props[PROP_STATUS] = {"select": {"name": TARGET_STATUS_VALUE}}
-
-    # 3) Entreprise (rich_text)
-    if lead.get("company") and PROP_COMPANY in db_meta["properties"] and db_meta["properties"][PROP_COMPANY]["type"] == "rich_text":
-        props[PROP_COMPANY] = {"rich_text": [{"text": {"content": lead["company"]}}]}
-
-    # 4) E-mail
-    if lead.get("email") and PROP_EMAIL in db_meta["properties"] and db_meta["properties"][PROP_EMAIL]["type"] == "email":
-        props[PROP_EMAIL] = {"email": lead["email"]}
-
-    # 5) Téléphone
-    if lead.get("phone") and PROP_PHONE in db_meta["properties"] and db_meta["properties"][PROP_PHONE]["type"] == "phone_number":
-        props[PROP_PHONE] = {"phone_number": lead["phone"]}
-
-    # 6) De quoi désirez-vous discuter ? (multi_select)
-    if PROP_TOPIC in db_meta["properties"] and db_meta["properties"][PROP_TOPIC]["type"] == "multi_select":
-        # On n'ajoute que les options autorisées
-        valid = set(opt["name"] for opt in db_meta["properties"][PROP_TOPIC]["multi_select"]["options"])
-        selected = [{"name": t} for t in topics if t in valid]
-        props[PROP_TOPIC] = {"multi_select": selected}
-
-    # 7) Notes (Parlez nous de vos besoins) en rich_text
-    if notes and PROP_NOTES in db_meta["properties"] and db_meta["properties"][PROP_NOTES]["type"] == "rich_text":
-        props[PROP_NOTES] = {"rich_text": [{"text": {"content": notes}}]}
-
-    return props
-
-def notion_upsert_lead(lead: dict, topics: list, notes: str) -> str:
-    db_meta = notion_get_db_meta()
-    props = build_properties_for_upsert(lead, topics, notes, db_meta)
-
-    existing_id = notion_find_page_by_email(lead.get("email"))
-    if existing_id:
-        notion.pages.update(page_id=existing_id, properties=props)
-        return existing_id
-    else:
-        page = notion.pages.create(parent={"database_id": NOTION_DB}, properties=props)
-        return page["id"]
-
-def _to_rich_text_chunks(text: str, chunk_size: int = 1800) -> list[dict]:
-    chunks: list[dict] = []
-    if not text:
-        return [{"text": {"content": ""}}]
-    for i in range(0, len(text), chunk_size):
-        segment = text[i : i + chunk_size]
-        chunks.append({"text": {"content": segment}})
-    return chunks
-
-
-def _normalize_name(name: str) -> str:
-    if not name:
-        return ""
-    nf = unicodedata.normalize("NFD", name)
-    without_accents = "".join(ch for ch in nf if unicodedata.category(ch) != "Mn")
-    return re.sub(r"\s+", " ", without_accents).strip().lower()
-
-
-def _find_property_key(target: str, properties: dict) -> str | None:
-    # 1) exact
-    if target in properties:
-        return target
-    # 2) case-insensitive
-    lower_map = {k.lower(): k for k in properties.keys()}
-    if target.lower() in lower_map:
-        return lower_map[target.lower()]
-    # 3) accent-insensitive
-    norm_target = _normalize_name(target)
-    norm_map = {_normalize_name(k): k for k in properties.keys()}
-    return norm_map.get(norm_target)
-
-
-def _ensure_rich_text_property(prop_name: str) -> tuple[bool, str | None]:
-    """Crée/convertit la propriété en rich_text dans la base si nécessaire."""
-    try:
-        db_meta = notion_get_db_meta()
-        props = db_meta.get("properties", {})
-        key = _find_property_key(prop_name, props)
-        if key and props[key].get("type") == "rich_text":
-            return True, None
-        # Créer/mettre à jour le schéma
-        notion.databases.update(
-            database_id=NOTION_DB,
-            properties={prop_name: {"rich_text": {}}},
-        )
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-
-def notion_set_email_draft(page_id: str, draft: str) -> tuple[bool, str | None]:
-    """Met à jour le champ brouillon dans Notion.
-    Retourne (ok, message_erreur).
-    """
-    try:
-        db_meta = notion_get_db_meta()
-    except Exception as e:
-        return False, f"Lecture schéma Notion impossible: {e}"
-
-    properties = db_meta.get("properties", {})
-
-    # 1) Trouver la clé réelle (gère casse/accents), puis vérifier le type
-    prop_key = _find_property_key(PROP_EMAIL_DRAFT, properties)
-    if prop_key:
-        ptype = properties[prop_key].get("type")
-        if ptype != "rich_text":
-            # Tenter la mise à jour du schéma en rich_text
-            ok_schema, err_schema = _ensure_rich_text_property(PROP_EMAIL_DRAFT)
-            if not ok_schema:
-                return False, f"La propriété '{prop_key}' n'est pas rich_text (type: {ptype}) et MAJ schéma impossible: {err_schema}"
-        try:
-            notion.pages.update(
-                page_id=page_id,
-                properties={prop_key: {"rich_text": _to_rich_text_chunks(draft)}},
-            )
-            # Vérification lecture
-            page = notion.pages.retrieve(page_id)
-            val = page.get("properties", {}).get(prop_key, {})
-            rt = val.get("rich_text", [])
-            ok = bool(rt and (rt[0].get("plain_text") or rt[0].get("text", {}).get("content")))
-            return (True, None) if ok else (False, "Écriture effectuée mais lecture vide après mise à jour.")
-        except Exception as e:
-            return False, f"Échec mise à jour Notion: {e}"
-
-    # 2) Fallback: quelques noms usuels si l'exact n'est pas trouvé
-    candidates = ["Brouillon à envoyer", "Email draft", "Brouillon", "Proposition d'email", "Email"]
-    lower_map = {k.lower(): k for k in properties.keys()}
-    for c in candidates:
-        k = lower_map.get(c.lower())
-        if not k:
-            continue
-        if properties[k].get("type") != "rich_text":
-            continue
-        try:
-            notion.pages.update(
-                page_id=page_id,
-                properties={k: {"rich_text": _to_rich_text_chunks(draft)}},
-            )
-            page = notion.pages.retrieve(page_id)
-            val = page.get("properties", {}).get(k, {})
-            rt = val.get("rich_text", [])
-            ok = bool(rt and (rt[0].get("plain_text") or rt[0].get("text", {}).get("content")))
-            return (True, None) if ok else (False, f"Écriture sur '{k}' effectuée mais lecture vide.")
-        except Exception as e:
-            return False, f"Échec mise à jour sur '{k}': {e}"
-
-    return False, f"Propriété '{PROP_EMAIL_DRAFT}' introuvable dans la base Notion, et aucun fallback compatible."
-
-
-def notion_append_email_draft_block(page_id: str, draft: str) -> tuple[bool, str | None]:
-    """Ajoute un bloc visible dans le contenu de la page (heading + code/markdown).
-    Utile si l'utilisateur a ajouté un 'onglet' (section) dans la page plutôt qu'une propriété.
-    """
-    try:
-        heading_block = {
-            "object": "block",
-            "type": "heading_2",
-            "heading_2": {
-                "rich_text": [{"type": "text", "text": {"content": "Brouillon à envoyer"}}]
-            },
-        }
-        code_block = {
-            "object": "block",
-            "type": "code",
-            "code": {
-                "language": "markdown",
-                "rich_text": [
-                    {"type": "text", "text": {"content": chunk["text"]["content"]}}
-                    for chunk in _to_rich_text_chunks(draft)
-                ],
-            },
-        }
-        notion.blocks.children.append(block_id=page_id, children=[heading_block, code_block])
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-# ===================
-# UI
-# ===================
-st.title("🪪 Carte → Notion (Mistral OCR + LLM)")
-st.caption("Prends la carte en photo (mobile OK) ou dépose une image. Statut = Leads entrant. Multi-sélection + Notes + Brouillon email.")
-
-photo = st.camera_input("Prends la carte en photo")
-notes = st.text_area("Parlez-nous de vos besoins", "")
-
-topics = st.multiselect(
-    "De quoi désirez-vous discuter ?",
-    TOPIC_OPTIONS,
-    default=[],
-    help="Sera écrit dans la propriété multi-sélection."
-)
-
-col1, col2 = st.columns(2)
-with col1:
-    uploaded = st.file_uploader("Ou téléverse une image", type=["png","jpg","jpeg"])
-with col2:
-    st.write("")  # placeholder
-
-img = uploaded if uploaded is not None else photo
-
-if st.button("Traiter") and img:
-    img_bytes = img.getvalue()
-
-    # 1) OCR
-    try:
-        with st.spinner("OCR Mistral…"):
-            ocr_text = call_mistral_ocr(img_bytes)
-            if not ocr_text.strip():
-                raise RuntimeError("OCR vide.")
-    except Exception as e:
-        st.error(f"OCR en échec : {e}")
-        st.stop()
-
-    # 2) Extraction → normalisation
-    rough = naive_extract(ocr_text)
-    with st.spinner("Normalisation (LLM)…"):
-        lead = llm_structurize(rough)
-
-    # 3) Websearch (personne / entreprise) via Mistral Agents
-    with st.spinner("Recherche web (Mistral)…"):
-        web_summary, web_refs = run_web_enrichment(lead, notes)
-
-    # 4) Notion (upsert + statut + sujets + notes)
-    try:
-        with st.spinner("Écriture dans Notion…"):
-            page_id = notion_upsert_lead(lead, topics, notes)
-    except Exception as e:
-        st.error(f"Notion en échec : {e}")
-        st.stop()
-
-    # 5) Brouillon d’email (si champ approprié présent)
-    with st.spinner("Rédaction du brouillon d’email…"):
-        draft = generate_email_draft(lead, notes, web_context=web_summary or None)
-        ok, err = notion_set_email_draft(page_id, draft)
-        if ok:
-            # Lecture/aperçu pour vérifier
-            try:
-                db_meta_dbg = notion_get_db_meta()
-                props_dbg = db_meta_dbg.get("properties", {})
-                resolved_key = _find_property_key(PROP_EMAIL_DRAFT, props_dbg) or PROP_EMAIL_DRAFT
-                page_dbg = notion.pages.retrieve(page_id)
-                val_dbg = page_dbg.get("properties", {}).get(resolved_key, {})
-                rt_dbg = val_dbg.get("rich_text", [])
-                preview = "".join(
-                    [(item.get("plain_text") or item.get("text", {}).get("content", "")) for item in rt_dbg]
-                )
-                st.success(f"Brouillon écrit dans la propriété Notion ‘{resolved_key}’ ({len(preview)} caractères).")
-                if preview:
-                    st.caption("Aperçu de la valeur enregistrée dans Notion:")
-                    st.code(preview[:700], language="markdown")
-            except Exception:
-                pass
-        else:
-            st.warning(f"Propriété Notion non mise à jour: {err}. J'essaie d'ajouter un bloc dans la page…")
-            ok2, err2 = notion_append_email_draft_block(page_id, draft)
-            if ok2:
-                st.info("Brouillon ajouté dans le corps de la page Notion (bloc).")
-            else:
-                st.error(f"Échec d'ajout du brouillon dans le corps de la page: {err2}")
-
-    st.success("✅ Lead créé/mis à jour (Statut = Leads entrant) + sujets + notes + brouillon ajouté.")
-    st.subheader("Brouillon")
-    st.code(draft, language="markdown")
-
-    with st.expander("Texte OCR"):
-        st.text(ocr_text)
-
-    st.subheader("Contexte trouvé en ligne (Mistral Websearch)")
-    if web_summary:
-        st.markdown(web_summary)
-    else:
-        st.caption("Aucun résumé disponible.")
-    if web_refs:
-        st.caption("Sources")
-        for ref in web_refs[:8]:
-            title = ref.get("title") or ref.get("url")
-            url = ref.get("url")
-            src = ref.get("source")
-            st.markdown(f"- [{title}]({url}){f' — {src}' if src else ''}")
-else:
-    st.caption("Autorise la caméra sur mobile, ou dépose un fichier.")
+    # Entreprise
+    if lead.get("company") and PRO
