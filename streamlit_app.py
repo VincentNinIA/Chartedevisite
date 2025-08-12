@@ -43,8 +43,7 @@ PROP_EMAIL_DRAFT  = "Brouillon à envoyer"                           # rich_text
 TARGET_STATUS_VALUE = "Leads entrant"
 TOPIC_OPTIONS = ["Formation", "Module", "Audit IA"]
 
-# Debug léger
-DEBUG = False
+DEBUG = False  # passe à True si tu veux voir les logs de titre
 
 # Clients
 notion  = Notion(auth=NOTION_TOKEN)
@@ -104,6 +103,11 @@ _md_head = re.compile(r'^\s{0,3}#{1,6}\s*')
 _md_emph = re.compile(r'(\*\*|\*|__|_)')
 _md_code = re.compile(r'`+')
 _md_bullet = re.compile(r'^\s*[-*•]\s+')
+
+RE_STREET = re.compile(r'\b(rue|avenue|av\.|bd|boulevard|chemin|route|impasse|all[ée]e|place|quai|ZA|ZI|BP|cedex)\b', re.I)
+RE_PHONE  = re.compile(r'\+?\d[\d\.\s\-]{6,}\d')
+RE_EMAIL  = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
+RE_URL    = re.compile(r'(https?://\S+|www\.\S+)')
 
 def strip_markdown(s: Optional[str]) -> str:
     if not s:
@@ -246,17 +250,69 @@ def _guess_last_first(full_name: str):
         return parts[-1], " ".join(parts[:-1])
     return None, s
 
+# ---- Nettoyages avancés nom/société pour le TITRE
+def normalize_company_name(s: Optional[str], email: Optional[str] = None) -> str:
+    s = strip_markdown(s or "")
+    s = RE_URL.sub("", s)
+    s = RE_EMAIL.sub("", s)
+    s = RE_PHONE.sub("", s)
+    for sep in [" - ", " — ", " – "]:
+        if sep in s:
+            left, right = s.split(sep, 1)
+            if RE_STREET.search(right) or re.search(r'\d', right):
+                s = left
+                break
+    m = RE_STREET.search(s)
+    if m:
+        s = s[:m.start()]
+    words = [w for w in re.split(r"\s+", s) if w and not re.match(r"^\d", w)]
+    s = " ".join(words[:5]).strip(" ,;-")
+    if not s and email:
+        dom = email.split("@")[-1]
+        root = dom.split(".")[0]
+        s = root.replace("-", " ").upper()
+    return s[:80]
+
+def strip_company_prefix_from_full_name(full_name: Optional[str], company: Optional[str], email: Optional[str] = None) -> str:
+    s = strip_markdown(full_name or "")
+    comp = normalize_company_name(company or "", email=email)
+    if comp and s.upper().startswith(comp.upper() + " "):
+        s = s[len(comp):].strip()
+    s = RE_EMAIL.sub("", s)
+    s = RE_PHONE.sub("", s)
+    s = RE_URL.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip(" -–—,")
+    return s
+
+def sanitize_component_for_title(s: Optional[str]) -> str:
+    s = strip_markdown(s or "")
+    s = RE_EMAIL.sub("", s)
+    s = RE_PHONE.sub("", s)
+    s = RE_URL.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip(" -–—,")
+    return s
+
+def postprocess_lead(lead: Dict, raw_ocr: str) -> Dict:
+    lead["company"] = normalize_company_name(lead.get("company"), lead.get("email"))
+    lead["full_name"] = strip_company_prefix_from_full_name(lead.get("full_name"), lead.get("company"), lead.get("email"))
+    if lead.get("full_name") and (not lead.get("first_name") or not lead.get("last_name")):
+        glast, gfirst = _guess_last_first(lead["full_name"])
+        lead["last_name"]  = lead.get("last_name")  or glast
+        lead["first_name"] = lead.get("first_name") or gfirst
+    return lead
+
 def format_lead_title(lead: Dict) -> str:
     last = (lead.get("last_name") or "").strip()
     first = (lead.get("first_name") or "").strip()
-    company = (lead.get("company") or "").strip()
+    company = normalize_company_name(lead.get("company"), lead.get("email"))
     if not (last and first) and lead.get("full_name"):
         glast, gfirst = _guess_last_first(lead["full_name"])
-        last = last or (glast or "")
+        last  = last or (glast or "")
         first = first or (gfirst or "")
-    name_part = f"{last.upper()}, {first}" if (last and first) else (lead.get("full_name") or "").strip()
-    title = " - ".join([p for p in [name_part, company] if p]) or "Lead (inconnu)"
-    return title[:200]
+    name_part = sanitize_component_for_title(f"{last.upper()}, {first}" if (last and first) else (lead.get("full_name") or ""))
+    company_clean = sanitize_component_for_title(company)
+    title = " - ".join([p for p in [name_part, company_clean] if p]) or "Lead (inconnu)"
+    return title[:120]
 
 # ---- Title prop detection & cleaning
 def get_title_prop_key(db_meta: Dict) -> str:
@@ -430,7 +486,6 @@ def run_web_enrichment(lead: Dict, user_notes: str) -> Tuple[str, List[Dict]]:
                 return ("\n\n".join(final_text), all_refs)
         except Exception:
             pass
-    # Fallback sans web
     prompt = f"""
 Tu vas générer un bref contexte exploitable sur ce lead puis des idées d'usage de l'IA.
 Lead: {json.dumps(lead, ensure_ascii=False)}
@@ -680,7 +735,6 @@ img = uploaded if uploaded is not None else photo
 
 if st.button("Traiter") and img:
     img_bytes = img.getvalue()
-    # Pré-traitement image pour booster l’OCR
     img_bytes = preprocess_for_ocr(img_bytes)
 
     # 1) OCR
@@ -697,6 +751,7 @@ if st.button("Traiter") and img:
     rough = naive_extract(ocr_text)
     with st.spinner("Structuration (LLM + retriage)…"):
         lead = llm_structurize(rough, raw_ocr=ocr_text)
+        lead = postprocess_lead(lead, ocr_text)
 
     # 3) Websearch (optionnel)
     with st.spinner("Recherche web (Mistral)…"):
@@ -722,7 +777,7 @@ if st.button("Traiter") and img:
             else:
                 st.error(f"Impossible d'ajouter le brouillon : {err2}")
 
-    st.success("✅ Lead créé/mis à jour (titre OK) + sujets + notes + brouillon.")
+    st.success("✅ Lead créé/mis à jour (titre propre) + sujets + notes + brouillon.")
     st.subheader("Brouillon")
     st.code(draft, language="markdown")
 
