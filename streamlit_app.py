@@ -80,7 +80,48 @@ def call_mistral_ocr(image_bytes: bytes) -> str:
     return text or resp.get("text", "")
 
 # ===================
-# LLM
+# UTIL – nettoyage / heuristiques
+# ===================
+_md_link = re.compile(r'!\[.*?\]\(.*?\)|\[(.*?)\]\(.*?\)')
+_md_head = re.compile(r'^\s{0,3}#{1,6}\s*')
+_md_emph = re.compile(r'(\*\*|\*|__|_)')
+_md_code = re.compile(r'`+')
+_md_bullet = re.compile(r'^\s*[-*•]\s+')
+
+def strip_markdown(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    out_lines = []
+    for line in s.splitlines():
+        line = _md_link.sub(lambda m: m.group(1) if m.groups() else "", line)
+        line = _md_head.sub("", line)
+        line = _md_bullet.sub("", line)
+        line = _md_code.sub("", line)
+        line = _md_emph.sub("", line)
+        out_lines.append(line)
+    out = "\n".join(out_lines)
+    out = re.sub(r'\s+', ' ', out).strip()
+    return out
+
+def looks_like_person_name(s: Optional[str]) -> bool:
+    if not s:
+        return False
+    s = strip_markdown(s)
+    tokens = [t for t in re.split(r"[\s\-]+", s) if t]
+    if len(tokens) < 2:
+        return False
+    # 2+ mots avec capitale initiale (FR étendu)
+    ok = sum(1 for t in tokens if re.match(r"^[A-ZÀ-ÖØ-Ý][a-zà-öø-ÿ’'\-]+$", t)) >= 2
+    return ok
+
+def sanitize_lead_strings(lead: Dict) -> Dict:
+    for k in ["full_name", "first_name", "last_name", "company", "job_title", "email", "phone", "address"]:
+        if k in lead and isinstance(lead[k], str):
+            lead[k] = strip_markdown(lead[k])
+    return lead
+
+# ===================
+# LLM – extraction/structuration + retriage
 # ===================
 def _chat_complete_text(prompt: str, temperature: float = 0.3) -> str:
     res = mistral.chat.complete(
@@ -100,19 +141,24 @@ def _chat_complete_text(prompt: str, temperature: float = 0.3) -> str:
         return ""
 
 def naive_extract(text: str) -> Dict:
-    email = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
-    phone = re.search(r'(\+?\d[\d\s\.\-]{7,}\d)', text)
+    # Nettoie le markdown avant heuristiques
+    clean = strip_markdown(text)
+    email = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', clean)
+    phone = re.search(r'(\+?\d[\d\s\.\-]{7,}\d)', clean)
 
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    full_name = lines[0][:80] if lines else None
+    lines = [l.strip() for l in clean.splitlines() if l.strip()]
+    # Cherche un "nom de personne" dans les 6 premières lignes
+    full_name = next((l for l in lines[:6] if looks_like_person_name(l)), None)
+    # Titre de poste courant
     job_title = next(
-        (l[:80] for l in lines[:7] if re.search(
-            r'(CEO|CTO|COO|CMO|Sales|Commercial|Marketing|Achat|Achats|RH|DRH|DG|Direction|Manager|Responsable|Chef de|Ingénieur|Consultant)',
+        (l[:80] for l in lines[:10] if re.search(
+            r'(CEO|CTO|COO|CMO|Sales|Commercial|Marketing|Achat|Achats|RH|DRH|DG|Direction|Manager|Responsable|Chef de|Ingénieur|Consultant|Founder|Président|Gérant|Directeur)',
             l, re.I)),
         None
     )
+    # Devine la société : première ligne différente du nom, sans @/URL/tél
     company = next(
-        (l[:80] for l in lines[:7]
+        (l[:80] for l in lines[:10]
          if l not in {full_name, job_title} and not re.search(r'@|https?://|www\.|\+?\d', l)),
         None
     )
@@ -125,25 +171,79 @@ def naive_extract(text: str) -> Dict:
         "address": None
     }
 
+def llm_structurize(rough: Dict, raw_ocr: Optional[str] = None) -> Dict:
+    # Extraction prioritaire depuis l'OCR brut; le rough sert d'indice
+    prompt = f"""
+Tu reçois 1) le texte OCR brut (peut contenir du Markdown) et 2) un dict "rough" issu d'une heuristique possiblement erronée.
+Tâche: déduis les champs depuis l'OCR (en priorité), corrige "rough" si besoin.
+RENVOIE STRICTEMENT un JSON avec clés:
+full_name, first_name, last_name, company, job_title, email, phone (format E.164 si possible), address.
+Règles:
+- Ignore toute mise en forme Markdown (#, **, _, liens).
+- N'invente rien: mets null si inconnu.
+- Si la première ligne est la société et non la personne, ne confonds pas.
+- Format FR accepté pour téléphone; idéalement E.164.
+OCR: {json.dumps(raw_ocr or "", ensure_ascii=False)[:6000]}
+Rough: {json.dumps(rough, ensure_ascii=False)}
+Réponse uniquement le JSON.
+"""
+    content = _chat_complete_text(prompt, temperature=0.2)
+    try:
+        parsed = json.loads(content)
+    except Exception:
+        parsed = dict(rough)
+
+    # Garantir les clés
+    for k in ["full_name", "first_name", "last_name", "company", "job_title", "email", "phone", "address"]:
+        parsed.setdefault(k, None)
+
+    # Si first/last manquants → heuristique sur full_name
+    if not (parsed.get("first_name") and parsed.get("last_name")) and parsed.get("full_name"):
+        glast, gfirst = _guess_last_first(parsed["full_name"])
+        parsed["last_name"] = parsed.get("last_name") or glast
+        parsed["first_name"] = parsed.get("first_name") or gfirst
+
+    # Nettoyage
+    parsed = sanitize_lead_strings(parsed)
+    if parsed.get("phone"):
+        parsed["phone"] = re.sub(r"[^\d+]", "", parsed["phone"])
+
+    # Re-triage (corriger inversion nom/société)
+    parsed = retriage_lead(parsed)
+    return parsed
+
+def retriage_lead(lead: Dict) -> Dict:
+    # Si "company" ressemble à un nom de personne et que "full_name" n'en est pas un → swap
+    comp = lead.get("company") or ""
+    fname = lead.get("full_name") or ""
+    if looks_like_person_name(comp) and not looks_like_person_name(fname):
+        lead["full_name"], lead["company"] = comp, fname
+        # recalcul first/last
+        glast, gfirst = _guess_last_first(lead["full_name"])
+        if glast: lead["last_name"] = glast
+        if gfirst: lead["first_name"] = gfirst
+    # Si full_name vide et first/last dispo
+    if not lead.get("full_name") and (lead.get("first_name") or lead.get("last_name")):
+        parts = [lead.get("first_name") or "", lead.get("last_name") or ""]
+        lead["full_name"] = " ".join(p for p in parts if p).strip() or None
+    return lead
+
 # ---- Helpers nom complet → "NOM, Prénom"
 def _guess_last_first(full_name: str):
     s = re.sub(r"\s+", " ", (full_name or "")).strip()
     if not s:
         return None, None
-    # Forme "Nom, Prénom"
     if "," in s:
         left, right = [p.strip() for p in s.split(",", 1)]
         return left, right
     parts = s.split(" ")
     if len(parts) >= 2:
-        # Si le NOM est en majuscules dans la carte
         uppers = [p for p in parts if p.isupper() and len(p) > 1]
         if uppers:
             last = " ".join(uppers)
             first = " ".join([p for p in parts if p not in uppers]) or None
             return last, first
-        # Heuristique FR simple : dernier token = nom
-        return parts[-1], " ".join(parts[:-1])
+        return parts[-1], " ".join(parts[:-1])  # FR: Prénom(s) + Nom
     return None, s
 
 def format_lead_title(lead: Dict) -> str:
@@ -157,34 +257,6 @@ def format_lead_title(lead: Dict) -> str:
     name_part = f"{last.upper()}, {first}" if (last and first) else (lead.get("full_name") or "").strip()
     title = " - ".join([p for p in [name_part, company] if p]) or "Lead (inconnu)"
     return title[:200]
-
-def llm_structurize(rough: Dict) -> Dict:
-    prompt = f"""
-Tu reçois un dict Python avec des champs potentiellement incomplets d'un lead issu d'une carte de visite.
-Objectif: renvoyer STRICTEMENT un JSON avec les clés:
-full_name, first_name, last_name, company, job_title, email, phone (format E.164 si possible), address.
-N'invente rien: mets null si inconnu. Corrige formats FR (tél).
-Objet: {json.dumps(rough, ensure_ascii=False)}
-Réponds UNIQUEMENT par le JSON.
-"""
-    content = _chat_complete_text(prompt, temperature=0.2)
-    parsed = None
-    try:
-        parsed = json.loads(content)
-    except Exception:
-        parsed = dict(rough)  # fallback
-    # Garantir les clés
-    for k in ["full_name", "first_name", "last_name", "company", "job_title", "email", "phone", "address"]:
-        parsed.setdefault(k, None)
-    # Si first/last manquants → heuristique
-    if not (parsed.get("first_name") and parsed.get("last_name")) and parsed.get("full_name"):
-        glast, gfirst = _guess_last_first(parsed["full_name"])
-        parsed["last_name"] = parsed.get("last_name") or glast
-        parsed["first_name"] = parsed.get("first_name") or gfirst
-    # Nettoyage téléphone simple
-    if parsed.get("phone"):
-        parsed["phone"] = re.sub(r"[^\d+]", "", parsed["phone"])
-    return parsed
 
 def generate_email_draft(lead: Dict, notes: str, web_context: Optional[str] = None) -> str:
     prompt = f"""
@@ -277,336 +349,4 @@ def build_websearch_queries(lead: Dict) -> List[str]:
     if full_name and company:
         queries.append(f"Informations récentes et profil public de {full_name} ({role}) chez {company}.")
     elif full_name:
-        queries.append(f"Profil public et informations professionnelles de {full_name} ({role}).")
-    if company:
-        queries.append(f"Résumé de {company} (activité, effectifs, actualités récentes, produits).")
-        queries.append(f"Opportunités d'usage de l'IA pour {company} (marketing, ops, support, data).")
-    return [q for q in queries if q]
-
-def run_web_enrichment(lead: Dict, user_notes: str) -> Tuple[str, List[Dict]]:
-    agent_id = get_websearch_agent_id()
-    queries = build_websearch_queries(lead)
-    if agent_id and queries:
-        try:
-            final_text: List[str] = []
-            all_refs: List[Dict] = []
-            for q in queries:
-                text, refs = _ask_websearch_agent(agent_id, q)
-                if text:
-                    final_text.append(text)
-                if refs:
-                    all_refs.extend(refs)
-            if final_text:
-                final_text.append(
-                    "\nSynthèse actionnable: propose des pistes concrètes où Nin-IA peut aider (formations, audits, modules)."
-                )
-                return ("\n\n".join(final_text), all_refs)
-        except Exception:
-            pass
-    # Fallback sans web
-    prompt = f"""
-Tu vas générer un bref contexte exploitable sur ce lead puis des idées d'usage de l'IA.
-Lead: {json.dumps(lead, ensure_ascii=False)}
-Notes: {user_notes}
-1) Contexte probable (hypothèses explicites si nécessaire).
-2) 6 idées d'applications IA concrètes par domaine (marketing, ops, support, data, RH, produit), liste.
-"""
-    return (_chat_complete_text(prompt, temperature=0.4), [])
-
-# ===================
-# NOTION – utilitaires schéma
-# ===================
-def notion_get_db_meta() -> Dict:
-    return notion.databases.retrieve(NOTION_DB)
-
-def _normalize_name(name: str) -> str:
-    if not name:
-        return ""
-    nf = unicodedata.normalize("NFD", name)
-    without_accents = "".join(ch for ch in nf if unicodedata.category(ch) != "Mn")
-    return re.sub(r"\s+", " ", without_accents).strip().lower()
-
-def _find_property_key(target: str, properties: Dict) -> Optional[str]:
-    if target in properties:
-        return target
-    lower_map = {k.lower(): k for k in properties.keys()}
-    if target.lower() in lower_map:
-        return lower_map[target.lower()]
-    norm_target = _normalize_name(target)
-    norm_map = {_normalize_name(k): k for k in properties.keys()}
-    return norm_map.get(norm_target)
-
-def ensure_db_schema():
-    """Garantit que les propriétés clés existent avec le bon type; ajoute options si manquantes."""
-    meta = notion_get_db_meta()
-    props = meta.get("properties", {})
-
-    def ensure_rich_text(name: str):
-        if name in props and props[name]["type"] == "rich_text":
-            return
-        notion.databases.update(database_id=NOTION_DB, properties={name: {"rich_text": {}}})
-
-    def ensure_email(name: str):
-        if name in props and props[name]["type"] == "email":
-            return
-        notion.databases.update(database_id=NOTION_DB, properties={name: {"email": {}}})
-
-    def ensure_phone(name: str):
-        if name in props and props[name]["type"] == "phone_number":
-            return
-        notion.databases.update(database_id=NOTION_DB, properties={name: {"phone_number": {}}})
-
-    def ensure_multi_select(name: str, options: List[str]):
-        nonlocal props
-        if name not in props or props[name]["type"] != "multi_select":
-            notion.databases.update(
-                database_id=NOTION_DB,
-                properties={name: {"multi_select": {"options": [{"name": o} for o in options]}}}
-            )
-        else:
-            current = set(opt["name"] for opt in props[name]["multi_select"]["options"])
-            missing = [o for o in options if o not in current]
-            if missing:
-                new_opts = props[name]["multi_select"]["options"] + [{"name": o} for o in missing]
-                notion.databases.update(
-                    database_id=NOTION_DB,
-                    properties={name: {"multi_select": {"options": new_opts}}}
-                )
-
-    def ensure_status(name: str, required_value: str):
-        if name not in props:
-            notion.databases.update(
-                database_id=NOTION_DB,
-                properties={name: {"select": {"options": [{"name": required_value}]}}}
-            )
-            return
-        p = props[name]
-        if p["type"] == "status":
-            cur = set(opt["name"] for opt in p["status"]["options"])
-            if required_value not in cur:
-                new_opts = p["status"]["options"] + [{"name": required_value}]
-                notion.databases.update(
-                    database_id=NOTION_DB,
-                    properties={name: {"status": {"options": new_opts}}}
-                )
-        elif p["type"] == "select":
-            cur = set(opt["name"] for opt in p["select"]["options"])
-            if required_value not in cur:
-                new_opts = p["select"]["options"] + [{"name": required_value}]
-                notion.databases.update(
-                    database_id=NOTION_DB,
-                    properties={name: {"select": {"options": new_opts}}}
-                )
-        else:
-            notion.databases.update(
-                database_id=NOTION_DB,
-                properties={name: {"select": {"options": [{"name": required_value}]}}}
-            )
-
-    ensure_status(PROP_STATUS, TARGET_STATUS_VALUE)
-    ensure_email(PROP_EMAIL)
-    ensure_phone(PROP_PHONE)
-    ensure_rich_text(PROP_COMPANY)
-    ensure_rich_text(PROP_NOTES)
-    ensure_rich_text(PROP_EMAIL_DRAFT)
-    ensure_multi_select(PROP_TOPIC, TOPIC_OPTIONS)
-
-# Exécuter l’assurance schéma au démarrage
-try:
-    ensure_db_schema()
-except Exception as e:
-    st.warning(f"Impossible de garantir le schéma Notion (droits/partage ?) : {e}")
-
-# ===================
-# NOTION – CRUD
-# ===================
-def notion_find_page_by_email(email: Optional[str]) -> Optional[str]:
-    if not email:
-        return None
-    try:
-        res = notion.databases.query(
-            **{
-                "database_id": NOTION_DB,
-                "filter": {"property": PROP_EMAIL, "email": {"equals": email}}
-            }
-        )
-        results = res.get("results", [])
-        return results[0]["id"] if results else None
-    except Exception:
-        return None
-
-def build_properties_for_upsert(lead: Dict, topics: List[str], notes: str, db_meta: Dict) -> Dict:
-    props: Dict = {}
-
-    # ---- Titre : "NOM, Prénom - Entreprise"
-    title_text = format_lead_title(lead)
-    props[PROP_TITLE] = {"title": [{"text": {"content": title_text}}]}
-
-    # Statut
-    if PROP_STATUS in db_meta["properties"]:
-        ptype = db_meta["properties"][PROP_STATUS]["type"]
-        if ptype == "status":
-            props[PROP_STATUS] = {"status": {"name": TARGET_STATUS_VALUE}}
-        elif ptype == "select":
-            props[PROP_STATUS] = {"select": {"name": TARGET_STATUS_VALUE}}
-
-    # Entreprise
-    if lead.get("company") and PROP_COMPANY in db_meta["properties"] and db_meta["properties"][PROP_COMPANY]["type"] == "rich_text":
-        props[PROP_COMPANY] = {"rich_text": [{"text": {"content": lead["company"]}}]}
-
-    # E-mail
-    if lead.get("email") and PROP_EMAIL in db_meta["properties"] and db_meta["properties"][PROP_EMAIL]["type"] == "email":
-        props[PROP_EMAIL] = {"email": lead["email"]}
-
-    # Téléphone
-    if lead.get("phone") and PROP_PHONE in db_meta["properties"] and db_meta["properties"][PROP_PHONE]["type"] == "phone_number":
-        props[PROP_PHONE] = {"phone_number": lead["phone"]}
-
-    # Sujet (multi-select)
-    if PROP_TOPIC in db_meta["properties"] and db_meta["properties"][PROP_TOPIC]["type"] == "multi_select":
-        valid = set(opt["name"] for opt in db_meta["properties"][PROP_TOPIC]["multi_select"]["options"])
-        selected = [{"name": t} for t in topics if t in valid]
-        props[PROP_TOPIC] = {"multi_select": selected}
-
-    # Notes
-    if notes and PROP_NOTES in db_meta["properties"] and db_meta["properties"][PROP_NOTES]["type"] == "rich_text":
-        props[PROP_NOTES] = {"rich_text": [{"text": {"content": notes}}]}
-
-    return props
-
-def notion_upsert_lead(lead: Dict, topics: List[str], notes: str) -> str:
-    db_meta = notion_get_db_meta()
-    props = build_properties_for_upsert(lead, topics, notes, db_meta)
-    existing_id = notion_find_page_by_email(lead.get("email"))
-    if existing_id:
-        notion.pages.update(page_id=existing_id, properties=props)
-        return existing_id
-    page = notion.pages.create(parent={"database_id": NOTION_DB}, properties=props)
-    return page["id"]
-
-def _to_rich_text_chunks(text: str, chunk_size: int = 1800) -> List[Dict]:
-    chunks: List[Dict] = []
-    if not text:
-        return [{"text": {"content": ""}}]
-    for i in range(0, len(text), chunk_size):
-        segment = text[i : i + chunk_size]
-        chunks.append({"text": {"content": segment}})
-    return chunks
-
-def notion_set_email_draft(page_id: str, draft: str) -> Tuple[bool, Optional[str]]:
-    try:
-        page = notion.pages.update(
-            page_id=page_id,
-            properties={PROP_EMAIL_DRAFT: {"rich_text": _to_rich_text_chunks(draft)}},
-        )
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-def notion_append_email_draft_block(page_id: str, draft: str) -> Tuple[bool, Optional[str]]:
-    try:
-        heading_block = {
-            "object": "block",
-            "type": "heading_2",
-            "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Brouillon à envoyer"}}]},
-        }
-        code_block = {
-            "object": "block",
-            "type": "code",
-            "code": {
-                "language": "markdown",
-                "rich_text": [{"type": "text", "text": {"content": chunk["text"]["content"]}} for chunk in _to_rich_text_chunks(draft)],
-            },
-        }
-        notion.blocks.children.append(block_id=page_id, children=[heading_block, code_block])
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-# ===================
-# UI
-# ===================
-st.title("🪪 Carte → Notion (Mistral OCR + LLM)")
-st.caption("Photo (mobile OK) → OCR → Lead Notion (Statut = Leads entrant) → Sujets → Notes → Brouillon email.")
-
-photo = st.camera_input("Prends la carte en photo")
-notes = st.text_area("Parlez-nous de vos besoins", "")
-
-topics = st.multiselect(
-    "De quoi désirez-vous discuter ?",
-    TOPIC_OPTIONS,
-    default=[],
-    help="Sera écrit dans la propriété multi-sélection."
-)
-
-col1, col2 = st.columns(2)
-with col1:
-    uploaded = st.file_uploader("Ou téléverse une image", type=["png","jpg","jpeg"])
-with col2:
-    st.write("")
-
-img = uploaded if uploaded is not None else photo
-
-if st.button("Traiter") and img:
-    img_bytes = img.getvalue()
-
-    # 1) OCR
-    try:
-        with st.spinner("OCR Mistral…"):
-            ocr_text = call_mistral_ocr(img_bytes)
-            if not ocr_text.strip():
-                raise RuntimeError("OCR vide.")
-    except Exception as e:
-        st.error(f"OCR en échec : {e}")
-        st.stop()
-
-    # 2) Extraction → normalisation
-    rough = naive_extract(ocr_text)
-    with st.spinner("Normalisation (LLM)…"):
-        lead = llm_structurize(rough)
-
-    # 3) Websearch (optionnel)
-    with st.spinner("Recherche web (Mistral)…"):
-        web_summary, web_refs = run_web_enrichment(lead, notes)
-
-    # 4) Notion (upsert + statut + sujets + notes)
-    try:
-        with st.spinner("Écriture dans Notion…"):
-            page_id = notion_upsert_lead(lead, topics, notes)
-    except Exception as e:
-        st.error(f"Notion en échec : {e}")
-        st.stop()
-
-    # 5) Brouillon d’email
-    with st.spinner("Rédaction du brouillon d’email…"):
-        draft = generate_email_draft(lead, notes, web_context=web_summary or None)
-        ok, err = notion_set_email_draft(page_id, draft)
-        if not ok:
-            st.warning(f"Propriété '{PROP_EMAIL_DRAFT}' indisponible ({err}). Ajout dans le corps de la page…")
-            ok2, err2 = notion_append_email_draft_block(page_id, draft)
-            if ok2:
-                st.info("Brouillon ajouté dans le corps de la page (bloc).")
-            else:
-                st.error(f"Impossible d'ajouter le brouillon : {err2}")
-
-    st.success("✅ Lead créé/mis à jour (Statut = Leads entrant) + sujets + notes + brouillon ajouté.")
-    st.subheader("Brouillon")
-    st.code(draft, language="markdown")
-
-    with st.expander("Texte OCR"):
-        st.text(ocr_text)
-
-    st.subheader("Contexte trouvé en ligne (Mistral Websearch)")
-    if web_summary:
-        st.markdown(web_summary)
-    else:
-        st.caption("Aucun résumé disponible.")
-    if web_refs:
-        st.caption("Sources")
-        for ref in web_refs[:8]:
-            title = ref.get("title") or ref.get("url")
-            url = ref.get("url")
-            src = ref.get("source")
-            st.markdown(f"- [{title}]({url}){f' — {src}' if src else ''}")
-else:
-    st.caption("Autorise la caméra sur mobile, ou dépose un fichier.")
+        queries.append
