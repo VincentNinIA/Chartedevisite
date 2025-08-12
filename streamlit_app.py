@@ -401,4 +401,157 @@ def build_properties_for_upsert(lead: Dict, topics: List[str], notes: str, db_me
         elif ptype == "select":
             props[PROP_STATUS] = {"select": {"name": TARGET_STATUS_VALUE}}
     # Entreprise
-    if lead.get("company") and PRO
+    if lead.get("company") and PROP_COMPANY in db_meta["properties"] and db_meta["properties"][PROP_COMPANY]["type"] == "rich_text":
+        props[PROP_COMPANY] = {"rich_text": [{"text": {"content": lead["company"]}}]}
+    # E-mail
+    if lead.get("email") and PROP_EMAIL in db_meta["properties"] and db_meta["properties"][PROP_EMAIL]["type"] == "email":
+        props[PROP_EMAIL] = {"email": lead["email"]}
+    # Téléphone
+    if lead.get("phone") and PROP_PHONE in db_meta["properties"] and db_meta["properties"][PROP_PHONE]["type"] == "phone_number":
+        props[PROP_PHONE] = {"phone_number": lead["phone"]}
+    # Sujet (multi-select)
+    if PROP_TOPIC in db_meta["properties"] and db_meta["properties"][PROP_TOPIC]["type"] == "multi_select":
+        valid = set(opt["name"] for opt in db_meta["properties"][PROP_TOPIC]["multi_select"]["options"])
+        selected = [{"name": t} for t in topics if t in valid]
+        props[PROP_TOPIC] = {"multi_select": selected}
+    # Notes
+    if notes and PROP_NOTES in db_meta["properties"] and db_meta["properties"][PROP_NOTES]["type"] == "rich_text":
+        props[PROP_NOTES] = {"rich_text": [{"text": {"content": notes}}]}
+    return props
+
+def notion_upsert_lead(lead: Dict, topics: List[str], notes: str) -> str:
+    db_meta = notion_get_db_meta()
+    props = build_properties_for_upsert(lead, topics, notes, db_meta)
+    existing_id = notion_find_page_by_email(lead.get("email"))
+    if existing_id:
+        notion.pages.update(page_id=existing_id, properties=props)
+        return existing_id
+    page = notion.pages.create(parent={"database_id": NOTION_DB}, properties=props)
+    return page["id"]
+
+def _to_rich_text_chunks(text: str, chunk_size: int = 1800) -> List[Dict]:
+    chunks: List[Dict] = []
+    if not text:
+        return [{"text": {"content": ""}}]
+    for i in range(0, len(text), chunk_size):
+        segment = text[i : i + chunk_size]
+        chunks.append({"text": {"content": segment}})
+    return chunks
+
+def notion_set_email_draft(page_id: str, draft: str) -> Tuple[bool, Optional[str]]:
+    try:
+        page = notion.pages.update(
+            page_id=page_id,
+            properties={PROP_EMAIL_DRAFT: {"rich_text": _to_rich_text_chunks(draft)}},
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def notion_append_email_draft_block(page_id: str, draft: str) -> Tuple[bool, Optional[str]]:
+    try:
+        heading_block = {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Brouillon à envoyer"}}]},
+        }
+        code_block = {
+            "object": "block",
+            "type": "code",
+            "code": {
+                "language": "markdown",
+                "rich_text": [{"type": "text", "text": {"content": chunk["text"]["content"]}} for chunk in _to_rich_text_chunks(draft)],
+            },
+        }
+        notion.blocks.children.append(block_id=page_id, children=[heading_block, code_block])
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+# ===================
+# UI
+# ===================
+st.title("🪪 Carte → Notion (Mistral OCR + LLM)")
+st.caption("Photo (mobile OK) → OCR → Lead Notion (Statut = Leads entrant) → Sujets → Notes → Brouillon email.")
+
+photo = st.camera_input("Prends la carte en photo")
+notes = st.text_area("Parlez-nous de vos besoins", "")
+
+topics = st.multiselect(
+    "De quoi désirez-vous discuter ?",
+    TOPIC_OPTIONS,
+    default=[],
+    help="Sera écrit dans la propriété multi-sélection."
+)
+
+col1, col2 = st.columns(2)
+with col1:
+    uploaded = st.file_uploader("Ou téléverse une image", type=["png","jpg","jpeg"])
+with col2:
+    st.write("")
+
+img = uploaded if uploaded is not None else photo
+
+if st.button("Traiter") and img:
+    img_bytes = img.getvalue()
+
+    # 1) OCR
+    try:
+        with st.spinner("OCR Mistral…"):
+            ocr_text = call_mistral_ocr(img_bytes)
+            if not ocr_text.strip():
+                raise RuntimeError("OCR vide.")
+    except Exception as e:
+        st.error(f"OCR en échec : {e}")
+        st.stop()
+
+    # 2) Extraction → normalisation
+    rough = naive_extract(ocr_text)
+    with st.spinner("Normalisation (LLM)…"):
+        lead = llm_structurize(rough)
+
+    # 3) Websearch (optionnel)
+    with st.spinner("Recherche web (Mistral)…"):
+        web_summary, web_refs = run_web_enrichment(lead, notes)
+
+    # 4) Notion (upsert + statut + sujets + notes)
+    try:
+        with st.spinner("Écriture dans Notion…"):
+            page_id = notion_upsert_lead(lead, topics, notes)
+    except Exception as e:
+        st.error(f"Notion en échec : {e}")
+        st.stop()
+
+    # 5) Brouillon d’email
+    with st.spinner("Rédaction du brouillon d’email…"):
+        draft = generate_email_draft(lead, notes, web_context=web_summary or None)
+        ok, err = notion_set_email_draft(page_id, draft)
+        if not ok:
+            st.warning(f"Propriété '{PROP_EMAIL_DRAFT}' indisponible ({err}). Ajout dans le corps de la page…")
+            ok2, err2 = notion_append_email_draft_block(page_id, draft)
+            if ok2:
+                st.info("Brouillon ajouté dans le corps de la page (bloc).")
+            else:
+                st.error(f"Impossible d'ajouter le brouillon : {err2}")
+
+    st.success("✅ Lead créé/mis à jour (Statut = Leads entrant) + sujets + notes + brouillon ajouté.")
+    st.subheader("Brouillon")
+    st.code(draft, language="markdown")
+
+    with st.expander("Texte OCR"):
+        st.text(ocr_text)
+
+    st.subheader("Contexte trouvé en ligne (Mistral Websearch)")
+    if web_summary:
+        st.markdown(web_summary)
+    else:
+        st.caption("Aucun résumé disponible.")
+    if web_refs:
+        st.caption("Sources")
+        for ref in web_refs[:8]:
+            title = ref.get("title") or ref.get("url")
+            url = ref.get("url")
+            src = ref.get("source")
+            st.markdown(f"- [{title}]({url}){f' — {src}' if src else ''}")
+else:
+    st.caption("Autorise la caméra sur mobile, ou dépose un fichier.")
