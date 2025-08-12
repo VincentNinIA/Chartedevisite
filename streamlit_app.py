@@ -6,8 +6,10 @@ import requests
 import streamlit as st
 from typing import List, Dict, Optional, Tuple
 from notion_client import Client as Notion
-from mistralai import Mistral  # SDK récent
+from mistralai import Mistral
 import unicodedata
+from io import BytesIO
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 
 # ===================
 # CONFIG
@@ -29,9 +31,7 @@ MISTRAL_CHAT_MODEL = st.secrets.get("MISTRAL_CHAT_MODEL", "mistral-large-latest"
 MISTRAL_AGENTS_URL  = st.secrets.get("MISTRAL_AGENTS_URL", "https://api.mistral.ai/v1")
 MISTRAL_AGENT_MODEL = st.secrets.get("MISTRAL_AGENT_MODEL", MISTRAL_CHAT_MODEL)
 
-# ----- NOMS EXACTS DE TES PROPRIÉTÉS NOTION -----
-# (PROP_TITLE n'est plus utilisé; on détecte dynamiquement la vraie propriété title)
-PROP_TITLE        = "Nom"                                           # (non utilisé pour écrire)
+# ----- PROPRIÉTÉS NOTION (hors title qui est détecté dynamiquement)
 PROP_STATUS       = "Statut"                                        # status OU select
 PROP_COMPANY      = "Entreprise"                                    # rich_text
 PROP_EMAIL        = "E-mail"                                        # email
@@ -40,9 +40,11 @@ PROP_TOPIC        = "De quoi désirez-vous discuter ?"               # multi_sel
 PROP_NOTES        = "Parlez nous de vos besoins en quelques mots"   # rich_text
 PROP_EMAIL_DRAFT  = "Brouillon à envoyer"                           # rich_text
 
-# Valeurs/Options attendues
 TARGET_STATUS_VALUE = "Leads entrant"
 TOPIC_OPTIONS = ["Formation", "Module", "Audit IA"]
+
+# Debug léger
+DEBUG = False
 
 # Clients
 notion  = Notion(auth=NOTION_TOKEN)
@@ -51,6 +53,20 @@ mistral = Mistral(api_key=MISTRAL_KEY)
 # ===================
 # OCR
 # ===================
+def preprocess_for_ocr(img_bytes: bytes) -> bytes:
+    img = Image.open(BytesIO(img_bytes))
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("L")
+    img = ImageEnhance.Contrast(img).enhance(1.6)
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=160, threshold=3))
+    shortest = min(img.size)
+    if shortest < 1000:
+        scale = 1000 / shortest
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=92, optimize=True)
+    return out.getvalue()
+
 def _guess_data_url(image_bytes: bytes, fallback="image/jpeg") -> str:
     header = image_bytes[:8]
     if header.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -111,8 +127,7 @@ def looks_like_person_name(s: Optional[str]) -> bool:
     tokens = [t for t in re.split(r"[\s\-]+", s) if t]
     if len(tokens) < 2:
         return False
-    ok = sum(1 for t in tokens if re.match(r"^[A-ZÀ-ÖØ-Ý][a-zà-öø-ÿ’'\-]+$", t)) >= 2
-    return ok
+    return sum(1 for t in tokens if re.match(r"^[A-ZÀ-ÖØ-Ý][a-zà-öø-ÿ’'\-]+$", t)) >= 2
 
 def sanitize_lead_strings(lead: Dict) -> Dict:
     for k in ["full_name", "first_name", "last_name", "company", "job_title", "email", "phone", "address"]:
@@ -167,8 +182,8 @@ def naive_extract(text: str) -> Dict:
 
 def llm_structurize(rough: Dict, raw_ocr: Optional[str] = None) -> Dict:
     prompt = f"""
-Tu reçois 1) le texte OCR brut (peut contenir du Markdown) et 2) un dict "rough" issu d'une heuristique possiblement erronée.
-Tâche: déduis les champs depuis l'OCR (en priorité), corrige "rough" si besoin.
+Tu reçois 1) le texte OCR brut (peut contenir du Markdown) et 2) un dict rough possiblement erroné.
+Tâche: déduis les champs depuis l'OCR (prioritaire), corrige rough si besoin.
 RENVOIE STRICTEMENT un JSON avec clés:
 full_name, first_name, last_name, company, job_title, email, phone (format E.164 si possible), address.
 Règles:
@@ -245,11 +260,10 @@ def format_lead_title(lead: Dict) -> str:
 
 # ---- Title prop detection & cleaning
 def get_title_prop_key(db_meta: Dict) -> str:
-    props = db_meta.get("properties", {})
-    for k, v in props.items():
+    for k, v in db_meta.get("properties", {}).items():
         if v.get("type") == "title":
             return k
-    return "Name"  # fallback ultime
+    return "Name"
 
 def clean_title_text(s: str) -> str:
     s = strip_markdown(s or "")
@@ -258,19 +272,60 @@ def clean_title_text(s: str) -> str:
     s = re.sub(r"\s*[-–—]\s*", " - ", s)
     return s if s else "Lead (inconnu)"
 
-def generate_email_draft(lead: Dict, notes: str, web_context: Optional[str] = None) -> str:
+# ===================
+# EMAIL – contexte compressé
+# ===================
+def compress_context_for_email(web_context: Optional[str]) -> str:
+    if not web_context:
+        return ""
     prompt = f"""
-Tu es mon assistant commercial, tu travailles chez Nin-IA (formations IA, audits IA, modules IA).
-Tu reçois des cartes de visite + notes de clients potentiels. Personnalise l'email en te basant surtout sur les notes.
+Synthétise pour un email B2B en 5 puces factuelles et courtes :
+- Secteur/activité
+- Taille (ordre de grandeur)
+- Produits/services clés
+- Localisation(s)
+- Actu/points saillants récents
+Texte source :
+{web_context[:5000]}
+Réponds UNIQUEMENT avec 5 puces, sans phrase d'intro.
+"""
+    return _chat_complete_text(prompt, temperature=0.2).strip()
+
+def prepare_email_context_block(lead: Dict, web_context: Optional[str]) -> str:
+    bullets = compress_context_for_email(web_context)
+    parts = []
+    if lead.get("company"):
+        parts.append(f"Entreprise : {lead['company']}")
+    if lead.get("job_title") and lead.get("full_name"):
+        parts.append(f"Contact : {lead['full_name']} — {lead['job_title']}")
+    if bullets:
+        parts.append("Contexte :\n" + bullets)
+    return "\n".join(parts)
+
+def generate_email_draft(lead: Dict, notes: str, web_context: Optional[str] = None) -> str:
+    ctx = prepare_email_context_block(lead, web_context)
+    prompt = f"""
+Tu es SDR chez Nin-IA. Personnalise un email court (100-120 mots).
+Objectif : proposer un échange 15 min (Teams/téléphone) cette semaine.
+Contraintes :
+- Utilise AU MOINS 2 infos concrètes du bloc “Contexte” ci-dessous.
+- Adapte le ton aux notes. Pas de fluff.
+- B2B uniquement.
 
 Lead: {json.dumps(lead, ensure_ascii=False)}
-Notes: {notes}
-Objectif: proposer un échange (15 min) cette semaine (Teams ou téléphone).
-Style: pro, concret, ton léger si les notes le permettent. 100-120 mots.
+Notes: {notes or "—"}
+Contexte consolidé:
+{ctx}
+
+Structure attendue :
+1) Accroche personnalisée (1 phrase)
+2) Valeur pour eux (1-2 phrases) en citant 2 infos du contexte
+3) Proposition d'échange (créneaux)
+4) Signature courte Nin-IA
+
+Réponds par le texte de l'email UNIQUEMENT.
 """
-    if web_context:
-        prompt += f"\n\nContexte trouvé en ligne (synthèse, à utiliser seulement si pertinent):\n{web_context[:4000]}\n"
-    return _chat_complete_text(prompt, temperature=0.6)
+    return _chat_complete_text(prompt, temperature=0.5)
 
 # ===================
 # Agents (websearch)
@@ -375,6 +430,7 @@ def run_web_enrichment(lead: Dict, user_notes: str) -> Tuple[str, List[Dict]]:
                 return ("\n\n".join(final_text), all_refs)
         except Exception:
             pass
+    # Fallback sans web
     prompt = f"""
 Tu vas générer un bref contexte exploitable sur ce lead puis des idées d'usage de l'IA.
 Lead: {json.dumps(lead, ensure_ascii=False)}
@@ -397,18 +453,7 @@ def _normalize_name(name: str) -> str:
     without_accents = "".join(ch for ch in nf if unicodedata.category(ch) != "Mn")
     return re.sub(r"\s+", " ", without_accents).strip().lower()
 
-def _find_property_key(target: str, properties: Dict) -> Optional[str]:
-    if target in properties:
-        return target
-    lower_map = {k.lower(): k for k in properties.keys()}
-    if target.lower() in lower_map:
-        return lower_map[target.lower()]
-    norm_target = _normalize_name(target)
-    norm_map = {_normalize_name(k): k for k in properties.keys()}
-    return norm_map.get(norm_target)
-
 def ensure_db_schema():
-    """Garantit que les propriétés clés existent avec le bon type; ajoute options si manquantes."""
     meta = notion_get_db_meta()
     props = meta.get("properties", {})
 
@@ -482,7 +527,6 @@ def ensure_db_schema():
     ensure_rich_text(PROP_EMAIL_DRAFT)
     ensure_multi_select(PROP_TOPIC, TOPIC_OPTIONS)
 
-# Exécuter l’assurance schéma au démarrage
 try:
     ensure_db_schema()
 except Exception as e:
@@ -509,9 +553,11 @@ def notion_find_page_by_email(email: Optional[str]) -> Optional[str]:
 def build_properties_for_upsert(lead: Dict, topics: List[str], notes: str, db_meta: Dict) -> Dict:
     props: Dict = {}
 
-    # ---- Titre : "NOM, Prénom - Entreprise" sur la vraie propriété title
+    # Title fiable : on écrit sur la vraie propriété "title"
     title_key = get_title_prop_key(db_meta)
     title_text = clean_title_text(format_lead_title(lead))
+    if DEBUG:
+        st.caption(f"title_key={title_key} → {title_text}")
     props[title_key] = {"title": [{"type": "text", "text": {"content": title_text}}]}
 
     # Statut
@@ -556,6 +602,17 @@ def notion_upsert_lead(lead: Dict, topics: List[str], notes: str) -> str:
         return existing_id
 
     page = notion.pages.create(parent={"database_id": NOTION_DB}, properties=props)
+
+    # Ceinture+bretelles : reforce le title juste après création
+    try:
+        title_key = get_title_prop_key(notion_get_db_meta())
+        title_text = clean_title_text(format_lead_title(lead))
+        notion.pages.update(page_id=page["id"], properties={
+            title_key: {"title": [{"type": "text", "text": {"content": title_text}}]}
+        })
+    except Exception:
+        pass
+
     return page["id"]
 
 def _to_rich_text_chunks(text: str, chunk_size: int = 1800) -> List[Dict]:
@@ -623,6 +680,8 @@ img = uploaded if uploaded is not None else photo
 
 if st.button("Traiter") and img:
     img_bytes = img.getvalue()
+    # Pré-traitement image pour booster l’OCR
+    img_bytes = preprocess_for_ocr(img_bytes)
 
     # 1) OCR
     try:
@@ -651,7 +710,7 @@ if st.button("Traiter") and img:
         st.error(f"Notion en échec : {e}")
         st.stop()
 
-    # 5) Brouillon d’email
+    # 5) Brouillon d’email (avec contexte compressé)
     with st.spinner("Rédaction du brouillon d’email…"):
         draft = generate_email_draft(lead, notes, web_context=web_summary or None)
         ok, err = notion_set_email_draft(page_id, draft)
