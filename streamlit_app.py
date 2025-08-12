@@ -125,20 +125,66 @@ def naive_extract(text: str) -> Dict:
         "address": None
     }
 
+# ---- Helpers nom complet → "NOM, Prénom"
+def _guess_last_first(full_name: str):
+    s = re.sub(r"\s+", " ", (full_name or "")).strip()
+    if not s:
+        return None, None
+    # Forme "Nom, Prénom"
+    if "," in s:
+        left, right = [p.strip() for p in s.split(",", 1)]
+        return left, right
+    parts = s.split(" ")
+    if len(parts) >= 2:
+        # Si le NOM est en majuscules dans la carte
+        uppers = [p for p in parts if p.isupper() and len(p) > 1]
+        if uppers:
+            last = " ".join(uppers)
+            first = " ".join([p for p in parts if p not in uppers]) or None
+            return last, first
+        # Heuristique FR simple : dernier token = nom
+        return parts[-1], " ".join(parts[:-1])
+    return None, s
+
+def format_lead_title(lead: Dict) -> str:
+    last = (lead.get("last_name") or "").strip()
+    first = (lead.get("first_name") or "").strip()
+    company = (lead.get("company") or "").strip()
+    if not (last and first) and lead.get("full_name"):
+        glast, gfirst = _guess_last_first(lead["full_name"])
+        last = last or (glast or "")
+        first = first or (gfirst or "")
+    name_part = f"{last.upper()}, {first}" if (last and first) else (lead.get("full_name") or "").strip()
+    title = " - ".join([p for p in [name_part, company] if p]) or "Lead (inconnu)"
+    return title[:200]
+
 def llm_structurize(rough: Dict) -> Dict:
     prompt = f"""
 Tu reçois un dict Python avec des champs potentiellement incomplets d'un lead issu d'une carte de visite.
 Objectif: renvoyer STRICTEMENT un JSON avec les clés:
-full_name, company, job_title, email, phone (format E.164 si possible), address.
+full_name, first_name, last_name, company, job_title, email, phone (format E.164 si possible), address.
 N'invente rien: mets null si inconnu. Corrige formats FR (tél).
 Objet: {json.dumps(rough, ensure_ascii=False)}
 Réponds UNIQUEMENT par le JSON.
 """
     content = _chat_complete_text(prompt, temperature=0.2)
+    parsed = None
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
     except Exception:
-        return rough
+        parsed = dict(rough)  # fallback
+    # Garantir les clés
+    for k in ["full_name", "first_name", "last_name", "company", "job_title", "email", "phone", "address"]:
+        parsed.setdefault(k, None)
+    # Si first/last manquants → heuristique
+    if not (parsed.get("first_name") and parsed.get("last_name")) and parsed.get("full_name"):
+        glast, gfirst = _guess_last_first(parsed["full_name"])
+        parsed["last_name"] = parsed.get("last_name") or glast
+        parsed["first_name"] = parsed.get("first_name") or gfirst
+    # Nettoyage téléphone simple
+    if parsed.get("phone"):
+        parsed["phone"] = re.sub(r"[^\d+]", "", parsed["phone"])
+    return parsed
 
 def generate_email_draft(lead: Dict, notes: str, web_context: Optional[str] = None) -> str:
     prompt = f"""
@@ -391,8 +437,11 @@ def notion_find_page_by_email(email: Optional[str]) -> Optional[str]:
 
 def build_properties_for_upsert(lead: Dict, topics: List[str], notes: str, db_meta: Dict) -> Dict:
     props: Dict = {}
-    # Titre
-    props[PROP_TITLE] = {"title": [{"text": {"content": lead.get("full_name") or "Lead (inconnu)"}}]}
+
+    # ---- Titre : "NOM, Prénom - Entreprise"
+    title_text = format_lead_title(lead)
+    props[PROP_TITLE] = {"title": [{"text": {"content": title_text}}]}
+
     # Statut
     if PROP_STATUS in db_meta["properties"]:
         ptype = db_meta["properties"][PROP_STATUS]["type"]
@@ -400,23 +449,29 @@ def build_properties_for_upsert(lead: Dict, topics: List[str], notes: str, db_me
             props[PROP_STATUS] = {"status": {"name": TARGET_STATUS_VALUE}}
         elif ptype == "select":
             props[PROP_STATUS] = {"select": {"name": TARGET_STATUS_VALUE}}
+
     # Entreprise
     if lead.get("company") and PROP_COMPANY in db_meta["properties"] and db_meta["properties"][PROP_COMPANY]["type"] == "rich_text":
         props[PROP_COMPANY] = {"rich_text": [{"text": {"content": lead["company"]}}]}
+
     # E-mail
     if lead.get("email") and PROP_EMAIL in db_meta["properties"] and db_meta["properties"][PROP_EMAIL]["type"] == "email":
         props[PROP_EMAIL] = {"email": lead["email"]}
+
     # Téléphone
     if lead.get("phone") and PROP_PHONE in db_meta["properties"] and db_meta["properties"][PROP_PHONE]["type"] == "phone_number":
         props[PROP_PHONE] = {"phone_number": lead["phone"]}
+
     # Sujet (multi-select)
     if PROP_TOPIC in db_meta["properties"] and db_meta["properties"][PROP_TOPIC]["type"] == "multi_select":
         valid = set(opt["name"] for opt in db_meta["properties"][PROP_TOPIC]["multi_select"]["options"])
         selected = [{"name": t} for t in topics if t in valid]
         props[PROP_TOPIC] = {"multi_select": selected}
+
     # Notes
     if notes and PROP_NOTES in db_meta["properties"] and db_meta["properties"][PROP_NOTES]["type"] == "rich_text":
         props[PROP_NOTES] = {"rich_text": [{"text": {"content": notes}}]}
+
     return props
 
 def notion_upsert_lead(lead: Dict, topics: List[str], notes: str) -> str:
